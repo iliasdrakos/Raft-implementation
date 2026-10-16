@@ -1,5 +1,6 @@
 package gr.uop.ds.raft;
 
+import java.io.IOException;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.concurrent.Executors;
@@ -23,6 +24,7 @@ public class RaftNode {
 
     private final String nodeId;
     private final Map<String, RaftServiceGrpc.RaftServiceBlockingStub> peers = new LinkedHashMap<>();
+    private final PersistentState storage;
 
     // we change this values ONLY in a synchronized block or method
     private long currentTerm = 0;
@@ -32,8 +34,13 @@ public class RaftNode {
     private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(2);
     private ScheduledFuture<?> electionTimer;
 
-    public RaftNode(String nodeId, Map<String, Integer> cluster) {
+    public RaftNode(String nodeId, Map<String, Integer> cluster) throws IOException {
         this.nodeId = nodeId;
+        this.storage = new PersistentState(nodeId);
+        PersistentState.State saved = storage.load();
+        this.currentTerm = saved.currentTerm();
+        this.votedFor = saved.votedFor();
+        System.out.println("LOADED TERM:" + currentTerm);
         for (var e : cluster.entrySet()) {
             if (e.getKey().equals(nodeId)) continue;
             ManagedChannel ch = ManagedChannelBuilder.forAddress("localhost", e.getValue())
@@ -59,6 +66,7 @@ public class RaftNode {
         if(term > currentTerm) {
             currentTerm = term;
             votedFor = null;
+            storage.save(currentTerm, votedFor);
             role = Role.FOLLOWER;
             System.out.println("[" + this.nodeId +"] term is " + term + ": becoming follower");
         }
@@ -75,6 +83,7 @@ public class RaftNode {
                     .build();
         } else if(votedFor == null || votedFor.equals(req.getCandidateId())) { //i did not vote so i need to vote 
             votedFor = req.getCandidateId();
+            storage.save(currentTerm, votedFor);
             resetElectionTimer();
             rsp = VoteResponse.newBuilder()
                     .setTerm(currentTerm)
@@ -119,6 +128,7 @@ public class RaftNode {
             currentTerm++;
             role = Role.CANDIDATE; 
             votedFor = nodeId; 
+            storage.save(currentTerm, votedFor);
             electionTerm = currentTerm;
             System.out.println("[" + nodeId + "] term " + electionTerm + ": becoming CANDIDATE");
             resetElectionTimer();   //if the Voting ends with a tie then we try again later
