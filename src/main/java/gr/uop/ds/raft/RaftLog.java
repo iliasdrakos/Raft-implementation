@@ -46,6 +46,21 @@ public class RaftLog {
         }
     }
 
+    public boolean tryAppend(long prevLogIndex, long prevLogTerm, List<LogEntry> entries) {
+        if(termAt(prevLogIndex) != prevLogTerm) return false;
+
+        for(LogEntry element: entries) {
+            long existingTerm = termAt(element.getIndex());
+            if (existingTerm == -1) {                          // we don't have this position yet
+                append(element);
+            } else if(termAt(element.getIndex()) != element.getTerm()) {
+                truncateFrom(element.getIndex());
+                append(element);
+            }
+        }
+        return true;
+    }
+
     public void truncateFrom(long index) {
         Iterator<LogEntry> it = Logs.iterator();
 
@@ -59,7 +74,7 @@ public class RaftLog {
 
     public List<LogEntry> entriesFrom(long index) {
         List<LogEntry> temp_logs = new ArrayList<>();
-        
+
         for (LogEntry element : Logs) { 
             if(element.getIndex() >= index) {
                 temp_logs.add(element);

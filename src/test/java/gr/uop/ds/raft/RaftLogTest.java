@@ -2,6 +2,7 @@ package gr.uop.ds.raft;
 
 import gr.uop.ds.raft.proto.LogEntry;
 import org.junit.jupiter.api.Test;
+import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -60,5 +61,61 @@ class RaftLogTest {
         assertEquals(2, log.entriesFrom(2).size());
         assertEquals("b", log.entriesFrom(2).get(0).getCommand());
         assertTrue(log.entriesFrom(4).isEmpty());
+    }
+
+        @Test
+    void tryAppendRejectsWhenPrevDoesNotMatch() {
+        RaftLog log = new RaftLog();
+        log.append(entry(1, 1, "a"));
+        assertFalse(log.tryAppend(2, 1, List.of(entry(3, 1, "c"))));   // we don't have index 2
+        assertFalse(log.tryAppend(1, 2, List.of(entry(2, 2, "b"))));   // index 1 has term 1, not 2
+        assertEquals(1, log.lastIndex());                               // nothing changed
+    }
+
+    @Test
+    void tryAppendOnEmptyLogWithPrevZero() {
+        RaftLog log = new RaftLog();
+        assertTrue(log.tryAppend(0, 0, List.of(entry(1, 1, "a"), entry(2, 1, "b"))));
+        assertEquals(2, log.lastIndex());
+    }
+
+    @Test
+    void tryAppendHeartbeatWithNoEntries() {
+        RaftLog log = new RaftLog();
+        log.append(entry(1, 1, "a"));
+        assertTrue(log.tryAppend(1, 1, List.of()));
+        assertEquals(1, log.lastIndex());
+    }
+
+    @Test
+    void tryAppendReplacesConflictingTail() {
+        RaftLog log = new RaftLog();
+        log.append(entry(1, 1, "a"));
+        log.append(entry(2, 1, "b"));   // 2 and 3 came from an old leader
+        log.append(entry(3, 1, "c"));   // and were never committed
+        assertTrue(log.tryAppend(1, 1, List.of(entry(2, 2, "B"))));
+        assertEquals(2, log.lastIndex());               // old 2 and 3 are gone
+        assertEquals("B", log.get(2).getCommand());
+    }
+
+    @Test
+    void tryAppendDoesNotDeleteOnLateDuplicate() {
+        RaftLog log = new RaftLog();
+        log.append(entry(1, 1, "a"));
+        log.append(entry(2, 1, "b"));
+        log.append(entry(3, 1, "c"));
+        // a delayed AppendEntries carrying only entry 2 arrives after we already have 2 and 3
+        assertTrue(log.tryAppend(1, 1, List.of(entry(2, 1, "b"))));
+        assertEquals(3, log.lastIndex());               // entry 3 must survive
+    }
+
+    @Test
+    void tryAppendDoesNotDeleteOnLateDuplicateAfterTermChange() {
+        RaftLog log = new RaftLog();
+        log.append(entry(1, 1, "a"));
+        log.append(entry(2, 2, "b"));
+        log.append(entry(3, 2, "c"));
+        assertTrue(log.tryAppend(1, 1, List.of(entry(2, 2, "b"))));
+        assertEquals(3, log.lastIndex());               // entry 3 must survive
     }
 }
