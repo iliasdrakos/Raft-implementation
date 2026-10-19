@@ -26,8 +26,11 @@ public class RaftNode {
     private final Map<String, RaftServiceGrpc.RaftServiceBlockingStub> peers = new LinkedHashMap<>();
     private final Map<String, ManagedChannel> channels = new LinkedHashMap<>();
     private final PersistentState storage;
+    private final RaftLog log = new RaftLog();
 
     // we change this values ONLY in a synchronized block or method
+    private long commitIndex = 0;   // highest index known to be committed
+    private long lastApplied = 0;   // highest index applied to the state machine
     private long currentTerm = 0;
     private String votedFor = null;
     private Role role = Role.FOLLOWER;
@@ -113,9 +116,14 @@ public class RaftNode {
             if (role != Role.FOLLOWER) System.out.println("[" + nodeId + "] term " + req.getTerm() + ": following leader " + req.getLeaderId());
             role = Role.FOLLOWER;
             resetElectionTimer();
+            boolean ok = log.tryAppend(req.getPrevLogIndex(), req.getPrevLogTerm(), req.getEntriesList());
+            if(ok && req.getLeaderCommit() > commitIndex) { 
+                commitIndex = Math.min(req.getLeaderCommit(), req.getPrevLogIndex() + req.getEntriesCount());
+            }
+            applyCommitted();
             rsp = AppendResponse.newBuilder()
                     .setTerm(currentTerm)
-                    .setSuccess(true)
+                    .setSuccess(ok)
                     .build();
 
         }
@@ -182,6 +190,14 @@ public class RaftNode {
             } catch (StatusRuntimeException e) {
                 channels.get(peer.getKey()).resetConnectBackoff();
             }
+        }
+    }
+
+    // must be called while holding the lock (from a synchronized method)
+    private void applyCommitted() {
+        while(lastApplied < commitIndex) {
+            lastApplied++;
+            System.out.println("[" + nodeId + "] " + "apply " + lastApplied + ": " + log.get(lastApplied).getCommand());
         }
     }
 }
