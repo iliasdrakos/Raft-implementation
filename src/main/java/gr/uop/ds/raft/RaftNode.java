@@ -24,6 +24,7 @@ public class RaftNode {
 
     private final String nodeId;
     private final Map<String, RaftServiceGrpc.RaftServiceBlockingStub> peers = new LinkedHashMap<>();
+    private final Map<String, ManagedChannel> channels = new LinkedHashMap<>();
     private final PersistentState storage;
 
     // we change this values ONLY in a synchronized block or method
@@ -45,6 +46,7 @@ public class RaftNode {
             if (e.getKey().equals(nodeId)) continue;
             ManagedChannel ch = ManagedChannelBuilder.forAddress("localhost", e.getValue())
                     .usePlaintext().build();
+            channels.put(e.getKey(), ch);
             peers.put(e.getKey(), RaftServiceGrpc.newBlockingStub(ch));
         }
     }
@@ -135,13 +137,13 @@ public class RaftNode {
         }
 
         int votes = 1;   // my vote
-        for (var peer : peers.values()) {
+        for (var peer : peers.entrySet()) {
             try {
                 VoteRequest req = VoteRequest.newBuilder()
                         .setTerm(electionTerm)
                         .setCandidateId(nodeId)
                         .build();
-                VoteResponse resp = peer.withDeadlineAfter(300, TimeUnit.MILLISECONDS).requestVote(req);
+                VoteResponse resp = peer.getValue().withDeadlineAfter(300, TimeUnit.MILLISECONDS).requestVote(req);
                 if(resp.getTerm() > electionTerm) {
                     stepDownIfNewerTerm(resp.getTerm());
                     return;
@@ -149,7 +151,7 @@ public class RaftNode {
                     votes++;
                 }
             } catch (StatusRuntimeException e) {
-                // a node is missing we don't care about him :)
+                channels.get(peer.getKey()).resetConnectBackoff();
             }
         }
 
@@ -169,16 +171,16 @@ public class RaftNode {
             if (role != Role.LEADER) return;
             term = currentTerm;
         }
-        for (var peer : peers.values()) {
+        for (var peer : peers.entrySet()) {
             try {
                 AppendRequest req = AppendRequest.newBuilder()
                         .setTerm(term)
                         .setLeaderId(nodeId)
                         .build();
-                AppendResponse resp = peer.withDeadlineAfter(300, TimeUnit.MILLISECONDS).appendEntries(req);
+                AppendResponse resp = peer.getValue().withDeadlineAfter(300, TimeUnit.MILLISECONDS).appendEntries(req);
                 stepDownIfNewerTerm(resp.getTerm());   // do we have any new leader;
             } catch (StatusRuntimeException e) {
-                // follower
+                channels.get(peer.getKey()).resetConnectBackoff();
             }
         }
     }
