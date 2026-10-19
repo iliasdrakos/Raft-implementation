@@ -132,7 +132,7 @@ public class RaftNode {
             votedFor = nodeId; 
             storage.save(currentTerm, votedFor);
             electionTerm = currentTerm;
-            System.out.println("[" + nodeId + "] term " + electionTerm + ": becoming CANDIDATE");
+            System.out.println("[" + nodeId + "] term " + electionTerm + ": becoming candidate");
             resetElectionTimer();   //if the Voting ends with a tie then we try again later
         }
 
