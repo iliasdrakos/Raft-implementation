@@ -1,5 +1,7 @@
 package gr.uop.ds.raft;
 
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
 import java.util.Map;
 
 import io.grpc.Server;
@@ -19,6 +21,12 @@ public class Raft {
                 .start();
         System.out.println("[" + nodeId + "] listening on port " + port);
         node.start();
+        // Temporary "client" to type commands in the leader's terminal, e.g. PUT x 5
+        BufferedReader in = new BufferedReader(new InputStreamReader(System.in));
+        String line;
+        while ((line = in.readLine()) != null) {
+            if (!line.isBlank()) node.submit(line.trim());
+        }
         server.awaitTermination();
     }
 }

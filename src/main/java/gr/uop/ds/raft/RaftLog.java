@@ -83,4 +83,16 @@ public class RaftLog {
         return temp_logs;
     }
 
+    // Election restriction: is the candidate's log at least as up-to-date as ours?
+    public boolean isUpToDate(long candidateLastTerm, long candidateLastIndex) {
+        long lastTerm = lastTerm();
+        if (candidateLastTerm > lastTerm) {
+            return true;
+        } else if (candidateLastTerm == lastTerm) {
+            return candidateLastIndex >= lastIndex();
+        } else {
+            return false;
+        }
+    }
+
 }

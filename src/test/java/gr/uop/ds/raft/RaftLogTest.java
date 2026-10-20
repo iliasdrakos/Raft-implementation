@@ -118,4 +118,31 @@ class RaftLogTest {
         assertTrue(log.tryAppend(1, 1, List.of(entry(2, 2, "b"))));
         assertEquals(3, log.lastIndex());               // entry 3 must survive
     }
+
+    @Test
+    void upToDateComparesLastTermFirst() {
+        RaftLog log = new RaftLog();
+        log.append(entry(1, 1, "a"));
+        log.append(entry(2, 2, "b"));                 // my last entry: index 2, term 2
+        assertTrue(log.isUpToDate(3, 1));             // higher last term wins, even if shorter
+        assertFalse(log.isUpToDate(1, 10));           // lower last term loses, even if longer
+    }
+
+    @Test
+    void upToDateWithSameLastTermComparesLength() {
+        RaftLog log = new RaftLog();
+        log.append(entry(1, 1, "a"));
+        log.append(entry(2, 2, "b"));
+        assertTrue(log.isUpToDate(2, 2));             // identical: ok
+        assertTrue(log.isUpToDate(2, 3));             // longer: ok
+        assertFalse(log.isUpToDate(2, 1));            // shorter: no
+    }
+
+    @Test
+    void emptyCandidateLogLosesAgainstNonEmpty() {
+        RaftLog log = new RaftLog();
+        log.append(entry(1, 1, "a"));
+        assertFalse(log.isUpToDate(0, 0));            // the scenario above: empty node3 must not win
+        assertTrue(new RaftLog().isUpToDate(0, 0));   // two empty logs are equal
+    }
 }
