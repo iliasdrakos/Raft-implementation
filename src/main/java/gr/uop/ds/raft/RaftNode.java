@@ -31,6 +31,7 @@ public class RaftNode {
     private final Map<String, Long> matchIndex = new HashMap<>();  // highest entry known to be on each peer
     private String currentLeader = null; // for each peer to know who is the leader
     private final PersistentState storage;
+    private final KvStore kv = new KvStore();
     private final RaftLog log = new RaftLog();
 
     // we change this values ONLY in a synchronized block or method
@@ -257,11 +258,16 @@ public class RaftNode {
         }
     }
 
+    // Reads from THIS node's copy of the store. On a follower the value may be slightly stale.
+    public synchronized String localGet(String key) {
+        return kv.get(key);
+    }
+
     // must be called while holding the lock (from a synchronized method)
     private void applyCommitted() {
         while(lastApplied < commitIndex) {
             lastApplied++;
-            System.out.println("[" + nodeId + "] " + "apply " + lastApplied + ": " + log.get(lastApplied).getCommand());
+            System.out.println("[" + nodeId + "] " + "apply " + lastApplied + ": " + log.get(lastApplied).getCommand() + "-> " + kv.apply(log.get(lastApplied).getCommand()));
         }
     }
 

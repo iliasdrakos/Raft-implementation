@@ -25,7 +25,21 @@ public class Raft {
         BufferedReader in = new BufferedReader(new InputStreamReader(System.in));
         String line;
         while ((line = in.readLine()) != null) {
-            if (!line.isBlank()) node.submit(line.trim());
+            line = line.trim();
+            if (line.isEmpty()) continue;
+
+            String[] parts = line.split("\\s+", 2);
+            if (parts[0].equalsIgnoreCase("GET")) {
+                if (parts.length < 2) {
+                    System.out.println("usage: GET key");
+                } else {
+                    String value = node.localGet(parts[1]);
+                    System.out.println("[" + nodeId + "] " + parts[1] + " = "
+                            + (value == null ? "(not found)" : value));
+                }
+            } else {
+                node.submit(line);   // PUT OR DEL go through Raft
+            }
         }
         server.awaitTermination();
     }
