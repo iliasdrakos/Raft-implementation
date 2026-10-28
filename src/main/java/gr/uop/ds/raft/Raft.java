@@ -7,8 +7,22 @@ import java.util.Map;
 import io.grpc.Server;
 import io.grpc.ServerBuilder;
 
-public class Raft {
 
+/**
+ * Entry point of one Raft node.
+ * Usage: { @code Raft <nodeId }, For now the cluster is fixed: node1..node3 on ports 50051..50053.
+ * It starts the gRPC server, then the node, and reads commands from the terminal:
+ *   GET key        answered from this node's own KvStore (on a follower the value may be stale)
+ *   PUT key value  goes to the log through submit(); only the leader accepts it
+ *   DEL key        same as PUT
+ */
+public class Raft {
+    
+    /**
+     * The gRPC server starts BEFORE node.start(): as soon as our timers run we may send
+     * or receive RPCs, so we must already be able to answer our peers.
+     * @param args args[0] is the id of this node (default is "node1")
+     */
     public static void main(String[] args) throws Exception {
         Map<String, Integer> cluster = Map.of("node1", 50051, "node2", 50052, "node3", 50053);
         String nodeId = args.length > 0 ? args[0] : "node1";

@@ -20,30 +20,55 @@ import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
 import io.grpc.StatusRuntimeException;
 
+/**
+ * One server of the Raft cluster.
+ * It holds the Raft state (term, vote, log, commit index), answers the two RPCs
+ * (RequestVote, AppendEntries) through RaftServiceImpl, runs the election timer
+ * and, while it is the leader, replicates its log to the followers with periodic heartbeats.
+ * Committed commands are applied, in log order, to the KvStore.
+ *
+ * Thread safety: all Raft state is guarded by the lock of this object (synchronized).
+ * Network calls are always made OUTSIDE the lock, so a slow peer never freezes the node.
+ */
 public class RaftNode {
 
+    /** The three roles of a Raft server. Every node starts as a FOLLOWER. */
     enum Role { FOLLOWER, CANDIDATE, LEADER }
 
-    private final String nodeId;
-    private final Map<String, RaftServiceGrpc.RaftServiceBlockingStub> peers = new LinkedHashMap<>();
-    private final Map<String, ManagedChannel> channels = new LinkedHashMap<>();
-    private final Map<String, Long> nextIndex = new HashMap<>();   // next entry to send to each peer 
-    private final Map<String, Long> matchIndex = new HashMap<>();  // highest entry known to be on each peer
-    private String currentLeader = null; // for each peer to know who is the leader
-    private final PersistentState storage;
-    private final KvStore kv = new KvStore();
-    private final RaftLog log = new RaftLog();
-
     // we change this values ONLY in a synchronized block or method
-    private long commitIndex = 0;   // highest index known to be committed
-    private long lastApplied = 0;   // highest index applied to the state machine
+
+    // Persistent state: implement later
     private long currentTerm = 0;
     private String votedFor = null;
+    private final RaftLog log = new RaftLog();
+
+    // Volatile state: lost on a crash and rebuilt afterwards
+    private long commitIndex = 0;   // highest index known to be committed
+    private long lastApplied = 0;   // highest index applied to the state machine
     private Role role = Role.FOLLOWER;
+    private String currentLeader = null; // who is the leader or null if we don't have one
+    private final KvStore kv = new KvStore(); // the state machine; rebuilt by re-applying the log after a restart
 
-    private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(2);
-    private ScheduledFuture<?> electionTimer;
+    // Leader-only volatile state: reinitialized in becomeLeader() after every election
+    private final Map<String, Long> nextIndex = new HashMap<>();   // next entry to send to each peer 
+    private final Map<String, Long> matchIndex = new HashMap<>();  // highest entry known to be on each peer
 
+    // Infrastructure: not part of the Raft algorithm, just what we need to run it
+    private final String nodeId;
+    private final PersistentState storage; // writes currentTerm and votedFor to data/<nodeId>/state.txt
+    private final Map<String, RaftServiceGrpc.RaftServiceBlockingStub> peers = new LinkedHashMap<>(); // one gRPC stub per other node
+    private final Map<String, ManagedChannel> channels = new LinkedHashMap<>(); // the connection behind each stub
+    private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(2); // runs the election timer and the heartbeats
+    private ScheduledFuture<?> electionTimer; // the pending startElection(); resetElectionTimer() replaces it
+
+    /**
+     * Creates the node as a FOLLOWER and restores currentTerm and votedFor from disk,
+     * so a restarted node never goes back to an older term and never forgets its vote.
+     * Also opens one gRPC channel to every other node of the cluster.
+     * @param nodeId  the id of this node, e.g. "node1"
+     * @param cluster all nodes of the cluster (id -> port), including this one
+     * @throws IOException if the saved state cannot be read
+     */
     public RaftNode(String nodeId, Map<String, Integer> cluster) throws IOException {
         this.nodeId = nodeId;
         this.storage = new PersistentState(nodeId);
@@ -60,48 +85,62 @@ public class RaftNode {
         }
     }
 
+    /**
+     * Starts the two background tasks: the election timer (on every node) and the
+     * heartbeat task every 500 ms (it does nothing unless this node is the leader).
+     * Called after the gRPC server is up, so we can already answer our peers.
+     */
     public void start() {
         resetElectionTimer();
         scheduler.scheduleAtFixedRate(this::sendHeartbeatsIfLeader, 0, 500, TimeUnit.MILLISECONDS);
     }
 
-    // Election Timer
+    // Election Timer is random because we don't want all of them to become a candidate and vote them self because we are going to be in a infinite election
     private synchronized void resetElectionTimer() {
         if (electionTimer != null) electionTimer.cancel(false);
         long timeout = 1500 + ThreadLocalRandom.current().nextLong(1500);  //1.5–3 s while testing
         electionTimer = scheduler.schedule(this::startElection, timeout, TimeUnit.MILLISECONDS);
     }
 
-    // if the term is a newer i have to become a follower
+    /**
+     * this method is called when another node has a newer term, then i need to become a follower
+     * @param term its the recent term that the node has
+     */
     private synchronized void stepDownIfNewerTerm(long term) {
         if(term > currentTerm) {
             currentTerm = term;
-            votedFor = null;
+            votedFor = null; // to vote another candidate
+            // persist BEFORE we answer anything in the new term
             storage.save(currentTerm, votedFor);
             role = Role.FOLLOWER;
             System.out.println("[" + this.nodeId +"] term is " + term + ": becoming follower");
         }
     }
 
-    //Handlers to see who can vote
+    /**
+     * Handles a RequestVote RPC a candidate asks for our vote. We grant at most one vote per term,
+     * and only to a candidate whose log is at least as up-to-date as ours.
+     * @param req a request from a candidate to vote him
+     * @return a responds if i want to vote for him or not
+     */
     public synchronized VoteResponse onRequestVote(VoteRequest req) {
         VoteResponse rsp;
-        stepDownIfNewerTerm(req.getTerm()); //if i dont have the new term i need to get it and become a follower
-        if(req.getTerm() < currentTerm) { // i have a smaller term from the candidate i cant vote
+        stepDownIfNewerTerm(req.getTerm()); // if i don't have the new term i need to get it and become a follower
+        if(req.getTerm() < currentTerm) { // he was an old candidate, i can't vote him
             rsp = VoteResponse.newBuilder()
                     .setTerm(currentTerm)
                     .setVoteGranted(false)
                     .build();
-        }  else if ((votedFor == null || votedFor.equals(req.getCandidateId())) && log.isUpToDate(req.getLastLogTerm(), req.getLastLogIndex()))  { //i did not vote so i need to vote 
+        }  else if ((votedFor == null || votedFor.equals(req.getCandidateId())) && log.isUpToDate(req.getLastLogTerm(), req.getLastLogIndex()))  { // i vote the candidate if his log is updated with the most recent log and if the same request came back. 
             votedFor = req.getCandidateId();
-            storage.save(currentTerm, votedFor);
-            resetElectionTimer();
+            storage.save(currentTerm, votedFor); // persist the vote BEFORE we answer, so after a crash we can't vote twice in this term
+            resetElectionTimer(); // give this candidate time to win instead of starting our own election
             rsp = VoteResponse.newBuilder()
                     .setTerm(currentTerm)
                     .setVoteGranted(true)
                     .build();
 
-        } else { // already voted
+        } else { // already voted or the log of the candidate is not updated
             rsp = VoteResponse.newBuilder()
                     .setTerm(currentTerm)
                     .setVoteGranted(false)
@@ -110,6 +149,15 @@ public class RaftNode {
         return rsp;
     }
 
+    /**
+     * Handles an AppendEntries RPC from a leader. It is both the heartbeat (no entries)
+     * and the way the leader replicates its log.
+     * A request from an older term is rejected, so the old leader learns our term and steps down.
+     * Otherwise we accept the sender as our leader, reset our election timer, run the
+     * consistency check (tryAppend) and move our commitIndex forward.
+     * @param req the leader's request
+     * @return our current term, and success = true only if our log matched at prevLogIndex
+     */
     public synchronized AppendResponse onAppendEntries(AppendRequest req) {
         AppendResponse rsp;
         if(req.getTerm() < currentTerm) { // Old Leader
@@ -119,15 +167,18 @@ public class RaftNode {
                     .build();
         } else { // if a candidate sees a leader in the same term he needs to resign
             stepDownIfNewerTerm(req.getTerm());
-            if (role != Role.FOLLOWER) System.out.println("[" + nodeId + "] term " + req.getTerm() + ": following leader " + req.getLeaderId());
+            if (role != Role.FOLLOWER) {
+                System.out.println("[" + nodeId + "] term " + req.getTerm() + ": following leader " + req.getLeaderId());
+            } 
             role = Role.FOLLOWER;
             currentLeader = req.getLeaderId();
-            resetElectionTimer();
+            resetElectionTimer(); // the leader is alive, so we must not start an election
+            // consistency check: accept the entries only if our log has prevLogIndex with prevLogTerm (Log Matching)
             boolean ok = log.tryAppend(req.getPrevLogIndex(), req.getPrevLogTerm(), req.getEntriesList());
             if(ok && req.getLeaderCommit() > commitIndex) { 
-                commitIndex = Math.min(req.getLeaderCommit(), req.getPrevLogIndex() + req.getEntriesCount());
+                commitIndex = Math.min(req.getLeaderCommit(), req.getPrevLogIndex() + req.getEntriesCount()); // min because the follower knows that his log are the same with the leader if only he has at least prevLogIndex + entriesCount
             }
-            applyCommitted();
+            applyCommitted(); // apply to the KvStore everything that just became committed
             rsp = AppendResponse.newBuilder()
                     .setTerm(currentTerm)
                     .setSuccess(ok)
@@ -154,19 +205,19 @@ public class RaftNode {
     }
 
     /**
-     * The startElection method is called when the peers don't have a leader(they don't get any heartbeat)
-     * and the need to elect one. 
+     * The startElection method is called from the timer of this node because 
+     * he didn't hear the leader from the timeout and the need to elect one. 
      * **/
     private void startElection() {
         long electionTerm;
         long lastLogIndex;
         long lastLogTerm;
         synchronized (this) {
-            if (role == Role.LEADER) { resetElectionTimer(); return; } // we have a leader
+            if (role == Role.LEADER) { resetElectionTimer(); return; } // I am already the leader
             currentTerm++;
             role = Role.CANDIDATE; 
             votedFor = nodeId; 
-            storage.save(currentTerm, votedFor); // save the variables in memory(.txt)
+            storage.save(currentTerm, votedFor); // writing in the disk
             lastLogIndex = log.lastIndex();
             lastLogTerm  = log.lastTerm();
             electionTerm = currentTerm;
@@ -184,17 +235,19 @@ public class RaftNode {
                         .setLastLogTerm(lastLogTerm)
                         .build();
                 VoteResponse resp = peer.getValue().withDeadlineAfter(300, TimeUnit.MILLISECONDS).requestVote(req);
-                if(resp.getTerm() > electionTerm) { //if he has a newer term step him down
+                if(resp.getTerm() > electionTerm) { //if he has a newer term step me down
                     stepDownIfNewerTerm(resp.getTerm());
                     return;
                 } else if(resp.getVoteGranted()) { // vote granted
                     votes++;
                 }
             } catch (StatusRuntimeException e) { // did not make it in time
+                // the peer is down or too slow, so no vote from it; resetConnectBackoff() lets us reconnect at once when it comes back
                 channels.get(peer.getKey()).resetConnectBackoff();
             }
         }
 
+        // we released the lock during the RPCs, so re-check that we are still a candidate in the same term
         synchronized (this) { 
             int majority = (peers.size() + 1) / 2 + 1;
             if(role == Role.CANDIDATE && currentTerm == electionTerm && votes >= majority) { // checking who got the majority of the votes
@@ -214,6 +267,8 @@ public class RaftNode {
             AppendRequest req;
             synchronized (this) {                       // build the request under the lock
                 if (role != Role.LEADER) return; // only the leader replicates
+                // we send the entries from nextIndex on; prevIndex/prevTerm describe the entry just before them,
+                // the follower uses them for the consistency check
                 long next = nextIndex.get(id);
                 long prevIndex = next - 1; 
                 long prevTerm = log.termAt(prevIndex);
@@ -230,6 +285,7 @@ public class RaftNode {
                 AppendResponse resp = peer.getValue().withDeadlineAfter(300, TimeUnit.MILLISECONDS).appendEntries(req);
                 onAppendResponse(id, req, resp);
             } catch (StatusRuntimeException e) {
+                // the follower is down or slow: we simply retry on the next heartbeat (500 ms)
                 channels.get(id).resetConnectBackoff();
             }
         }
@@ -244,10 +300,10 @@ public class RaftNode {
      * @param resp the follower's reply
      */
     private synchronized void onAppendResponse(String peer, AppendRequest req, AppendResponse resp) {
-        if(resp.getTerm() > currentTerm) { // has a newer term step him down
+        if(resp.getTerm() > currentTerm) { // has a newer term step me down
             stepDownIfNewerTerm(resp.getTerm());
         } else if(role != Role.LEADER || currentTerm != req.getTerm()) {
-            //this answer is stale (is far behind or lost the request)
+            // its a response from an old term or we are not the leader
         } else if(resp.getSuccess()) { // if he got it save it and prepare for commit
             matchIndex.put(peer, req.getPrevLogIndex() + req.getEntriesCount());
             nextIndex.put(peer,matchIndex.get(peer) + 1);
@@ -263,6 +319,10 @@ public class RaftNode {
         return kv.get(key);
     }
 
+    /**
+     * Applies to the KvStore, in log order, every entry after lastApplied up to commitIndex.
+     * Every node applies the same commands in the same order, so all KvStores end up identical.
+     */
     // must be called while holding the lock (from a synchronized method)
     private void applyCommitted() {
         while(lastApplied < commitIndex) {
@@ -271,12 +331,16 @@ public class RaftNode {
         }
     }
 
+    /**
+     * Called once we won the election. We don't know yet how far each follower's log goes,
+     * so we start optimistic (nextIndex = our last index + 1) and walk back on every failure.
+     */
     // must be called while holding the lock
     private void becomeLeader() {
         role = Role.LEADER;
         currentLeader = nodeId;
         for (String peer : peers.keySet()) {
-            nextIndex.put(peer, log.lastIndex() + 1); //assume they have everything we have
+            nextIndex.put(peer, log.lastIndex() + 1); // assume they have everything we have
             matchIndex.put(peer, 0L); //we have confirmed nothing yet
         }
         // An entry of our own term lets us commit older entries
@@ -297,6 +361,8 @@ public class RaftNode {
             for (long m : matchIndex.values()) {
                 if (m >= n) count++;                 // this follower has entry n
             }
+            // only an entry of OUR term may be committed by counting (Figure 8);
+            // the older entries before it become committed together with it
             if (count >= majority && log.termAt(n) == currentTerm) {
                  commitIndex = n; 
                  applyCommitted(); 
