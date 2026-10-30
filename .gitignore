@@ -2,4 +2,4 @@ target/
 data/
 .mvn/jvm.config
 .mvn/maven.config
-
+diagram.png
