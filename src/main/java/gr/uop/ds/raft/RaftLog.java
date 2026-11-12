@@ -1,5 +1,6 @@
 package gr.uop.ds.raft;
 
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
@@ -15,7 +16,18 @@ import gr.uop.ds.raft.proto.LogEntry;
  */
 public class RaftLog {
 
-    private final List<LogEntry> entries = new ArrayList<>(); // entry with index i is stored at position i - 1
+    private final List<LogEntry> entries; // entry with index i is stored at position i - 1
+    private final LogStorage storage; // so we can save our entries. null = memory only
+
+    public RaftLog() {
+        this.storage = null;
+        this.entries = new ArrayList<>();
+    }
+
+    public RaftLog(LogStorage storage) throws IOException {
+        this.storage = storage;
+        this.entries = this.storage.load();
+    }
 
     /** Index of the last entry, or 0 if the log is empty. */
     public long lastIndex() {
@@ -54,16 +66,26 @@ public class RaftLog {
         return entries.get(Math.toIntExact(index - 1));
     }
 
+    
     /**
-     * @param e is the Log entry that we save in our list IF it has the same index as the lastIndex + 1 (the next one)
-     * @throws IllegalArgumentException if the index is not lastIndex() + 1
+     * 
+     * Checks the index and adds the entry in memory only
      */
-    public void append(LogEntry e) {
+    private void addEntry(LogEntry e) {
         if(e.getIndex() != lastIndex() + 1) {
               throw new IllegalArgumentException("expected index " + (lastIndex() + 1) + " but got " + e.getIndex());
         } else {
             entries.add(e);
         }
+    }
+
+    /**
+     * @param e is the Log entry that we save in our list IF it has the same index as the lastIndex + 1 (the next one)
+     * @throws IllegalArgumentException if the index is not lastIndex() + 1
+     */
+    public void append(LogEntry e) {
+        addEntry(e); // check and add the entry
+        if(this.storage != null) this.storage.append(List.of(e)); //  save this one entry
     }
 
     /**
@@ -83,15 +105,19 @@ public class RaftLog {
     public boolean tryAppend(long prevLogIndex, long prevLogTerm, List<LogEntry> newEntries) {
         if(termAt(prevLogIndex) != prevLogTerm) return false; // if the terms don't match return 
 
+        List<LogEntry> added = new ArrayList<>();
         for(LogEntry element: newEntries) { // for every entry
             long existingTerm = termAt(element.getIndex());
             if (existingTerm == -1) {                          // we don't have this position yet, append it
-                append(element);
+                addEntry(element);
+                added.add(element);
             } else if(existingTerm != element.getTerm()) { // if the terms don't match
                 truncateFrom(element.getIndex()); // used when our entries conflict with the leader's
-                append(element); // then append the new ones
+                addEntry(element); // then append the new ones
+                added.add(element);
             }
         }
+        if(this.storage != null && !added.isEmpty()) this.storage.append(added); // one fsync for all
         return true;
     }
 
@@ -105,6 +131,7 @@ public class RaftLog {
                 it.remove();
             }
         }
+        if(this.storage != null) this.storage.rewrite(entries); // rewrite the file with what is left
     }
 
     // returns a copy used by the leader to send entries to a follower

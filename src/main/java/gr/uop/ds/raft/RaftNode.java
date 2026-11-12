@@ -1,6 +1,7 @@
 package gr.uop.ds.raft;
 
 import java.io.IOException;
+import java.nio.file.Path;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -40,7 +41,7 @@ public class RaftNode {
     // Persistent state: implement later
     private long currentTerm = 0;
     private String votedFor = null;
-    private final RaftLog log = new RaftLog();
+    private final RaftLog log;
 
     // Volatile state: lost on a crash and rebuilt afterwards
     private long commitIndex = 0;   // highest index known to be committed
@@ -72,10 +73,12 @@ public class RaftNode {
     public RaftNode(String nodeId, Map<String, Integer> cluster) throws IOException {
         this.nodeId = nodeId;
         this.storage = new PersistentState(nodeId);
+        this.log = new RaftLog(new LogStorage(Path.of("data", nodeId)));
         PersistentState.State saved = storage.load();
         this.currentTerm = saved.currentTerm();
         this.votedFor = saved.votedFor();
         System.out.println("LOADED TERM:" + currentTerm);
+        System.out.println("[" + nodeId + "] loaded " + log.lastIndex() + " log entries");
         for (var e : cluster.entrySet()) {
             if (e.getKey().equals(nodeId)) continue;
             ManagedChannel ch = ManagedChannelBuilder.forAddress("localhost", e.getValue())
