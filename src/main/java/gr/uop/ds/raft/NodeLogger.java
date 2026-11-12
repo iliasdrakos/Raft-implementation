@@ -6,6 +6,8 @@ import java.util.List;
 
 import gr.uop.ds.raft.proto.AppendRequest;
 import gr.uop.ds.raft.proto.AppendResponse;
+import gr.uop.ds.raft.proto.CommandRequest;
+import gr.uop.ds.raft.proto.CommandResponse;
 import gr.uop.ds.raft.proto.LogEntry;
 import gr.uop.ds.raft.proto.VoteRequest;
 import gr.uop.ds.raft.proto.VoteResponse;
@@ -109,5 +111,14 @@ public class NodeLogger {
             sb.append(", ... +").append(entries.size() - MAX_ENTRIES_SHOWN).append(" more");
         }
         return sb.append("]").toString();
+    }
+
+    public static String fmt(CommandRequest r) {
+        return "ClientCommand{command=\"" + r.getCommand() + "\"}";
+    }
+
+    public static String fmt(CommandResponse r) {
+        return "CommandResponse{success=" + r.getSuccess() + ", result=\"" + r.getResult()
+                + "\", leader=" + r.getLeaderId() + ", index=" + r.getIndex() + "}";
     }
 }

@@ -2,6 +2,8 @@ package gr.uop.ds.raft;
 
 import gr.uop.ds.raft.proto.AppendRequest;
 import gr.uop.ds.raft.proto.AppendResponse;
+import gr.uop.ds.raft.proto.CommandRequest;
+import gr.uop.ds.raft.proto.CommandResponse;
 import gr.uop.ds.raft.proto.RaftServiceGrpc;
 import gr.uop.ds.raft.proto.VoteRequest;
 import gr.uop.ds.raft.proto.VoteResponse;
@@ -35,6 +37,16 @@ public class RaftServiceImpl extends RaftServiceGrpc.RaftServiceImplBase {
     @Override
     public void appendEntries(AppendRequest req, StreamObserver<AppendResponse> out) {
         out.onNext(node.onAppendEntries(req));
+        out.onCompleted();
+    }
+
+    /**    
+     * Called by gRPC when a follower forwards a client command to us. 
+     * If we are the leader we append it; otherwise we answer "not the leader"
+     */
+    @Override
+    public void clientCommand(CommandRequest req, StreamObserver<CommandResponse> out) {
+        out.onNext(node.submit(req.getCommand()));
         out.onCompleted();
     }
 }

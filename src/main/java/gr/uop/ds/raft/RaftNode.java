@@ -1,5 +1,21 @@
 package gr.uop.ds.raft;
 
+import java.io.IOException;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+
 import static gr.uop.ds.raft.NodeLogger.Kind.APPLY;
 import static gr.uop.ds.raft.NodeLogger.Kind.CLIENT;
 import static gr.uop.ds.raft.NodeLogger.Kind.COMMIT;
@@ -12,22 +28,10 @@ import static gr.uop.ds.raft.NodeLogger.Kind.REPL;
 import static gr.uop.ds.raft.NodeLogger.Kind.SEND;
 import static gr.uop.ds.raft.NodeLogger.Kind.STATE;
 import static gr.uop.ds.raft.NodeLogger.Kind.VOTE;
-
-import java.io.IOException;
-import java.nio.file.Path;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.LinkedHashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.ScheduledFuture;
-import java.util.concurrent.ThreadLocalRandom;
-import java.util.concurrent.TimeUnit;
-
 import gr.uop.ds.raft.proto.AppendRequest;
 import gr.uop.ds.raft.proto.AppendResponse;
+import gr.uop.ds.raft.proto.CommandRequest;
+import gr.uop.ds.raft.proto.CommandResponse;
 import gr.uop.ds.raft.proto.LogEntry;
 import gr.uop.ds.raft.proto.RaftServiceGrpc;
 import gr.uop.ds.raft.proto.VoteRequest;
@@ -68,6 +72,7 @@ public class RaftNode {
     // Leader-only volatile state: reinitialized in becomeLeader() after every election
     private final Map<String, Long> nextIndex = new HashMap<>();   // next entry to send to each peer
     private final Map<String, Long> matchIndex = new HashMap<>();  // highest entry known to be on each peer
+    private final Map<Long, CompletableFuture<String>> pending = new HashMap<>(); // index -> waiting client
 
     // Infrastructure: not part of the Raft algorithm, just what we need to run it
     private final String nodeId;
@@ -146,6 +151,13 @@ public class RaftNode {
             currentLeader = null;
             print(STATE, oldRole + " -> FOLLOWER: " + from + " has newer term " + term + " (ours was " + oldTerm + ")");
             print(DISK, "saved state.txt: term=" + currentTerm + ", votedFor=none");
+            if (oldRole == Role.LEADER) {
+                // we are not the leader anymore
+                for (CompletableFuture<String> f : pending.values()) {
+                    f.completeExceptionally(new IllegalStateException("lost leadership"));
+                }
+                pending.clear();
+            }
         }
     }
 
@@ -273,22 +285,62 @@ public class RaftNode {
     }
 
     /**
-     * Entry point for client commands.
-     * A follower only tells the client who the leader is.
-     * The leader appends the command to its own log; it is NOT committed yet.
-     * The heartbeats replicate it, and it is applied once a majority has it.
+     * Leader side of a client command: appends it to the log and waits
+     * until it is committed and applied, so the client gets the real result.
+     * A follower answers "not the leader".
      * @param command the client's command, e.g. "PUT x 5"
      */
-    public synchronized void submit(String command) {
-        if (role != Role.LEADER) {
-            print(CLIENT, "\"" + command + "\" rejected: not the leader, the leader is "
-                    + (currentLeader == null ? "unknown" : currentLeader));
-            return;
+    public CommandResponse submit(String command) {
+        long index;
+        CompletableFuture<String> future = new CompletableFuture<>();
+        synchronized (this) {
+            if (role != Role.LEADER) {
+                print(CLIENT, "\"" + command + "\" rejected: not the leader, the leader is "
+                        + (currentLeader == null ? "unknown" : currentLeader));
+                return CommandResponse.newBuilder()
+                                    .setSuccess(false)
+                                    .setResult("not the leader")
+                                    .setLeaderId(currentLeader != null ? currentLeader : "")
+                                    .build();
+            }
+            index = log.lastIndex() + 1;
+            log.append(LogEntry.newBuilder().setIndex(index).setTerm(currentTerm).setCommand(command).build());
+            pending.put(index, future);
+            print(CLIENT, "\"" + command + "\" appended at index " + index + " (term " + currentTerm
+                    + "), saved to log.bin, waiting for a majority");
+            
         }
-        long index = log.lastIndex() + 1;
-        log.append(LogEntry.newBuilder().setIndex(index).setTerm(currentTerm).setCommand(command).build());
-        print(CLIENT, "\"" + command + "\" appended at index " + index + " (term " + currentTerm
-                + "), saved to log.bin, waiting for a majority");
+        
+        
+        try {
+            String result = future.get(1500, TimeUnit.MILLISECONDS);
+            return CommandResponse.newBuilder()
+                    .setSuccess(true)
+                    .setResult(result)
+                    .setLeaderId(nodeId)
+                    .setIndex(index)
+                        .build();
+        } catch (TimeoutException e) {
+            synchronized (this) {
+                pending.remove(index);
+            }
+            print(ERROR, "\"" + command + "\" (index " + index + ") was not committed within 1500 ms");
+            return CommandResponse.newBuilder()
+                    .setSuccess(false)
+                    .setResult("timeout: not committed yet, outcome unknown (no majority?)")
+                    .setLeaderId(nodeId)
+                    .setIndex(index)
+                    .build();
+        } catch (ExecutionException | InterruptedException e) {
+            String why = e.getCause() != null ? e.getCause().getMessage() : e.getMessage();
+            return CommandResponse.newBuilder()
+                    .setSuccess(false)
+                    .setResult("unknown outcome: " + why)
+                    .setLeaderId("")
+                    .setIndex(index)
+                    .build();
+        }
+                                  
     }
 
     /**
@@ -381,6 +433,7 @@ public class RaftNode {
         for (var peer : peers.entrySet()) {
             String id = peer.getKey();
             AppendRequest req;
+            boolean show;
             synchronized (this) {                       // build the request under the lock
                 if (role != Role.LEADER) return; // only the leader replicates
                 // we send the entries from nextIndex on; prevIndex/prevTerm describe the entry just before them,
@@ -396,9 +449,10 @@ public class RaftNode {
                             .addAllEntries(log.entriesFrom(next))
                             .setLeaderCommit(commitIndex)
                             .build(); // building the request
+                show = out.isVerbose() || (req.getEntriesCount() > 0 && !Boolean.FALSE.equals(peerUp.get(id)));
             } try {
                 // send outside the lock because a network call can take long and would freeze the whole node
-                if (req.getEntriesCount() > 0 || out.isVerbose()) {
+                if (show) {
                     print(SEND, "-> " + id + " " + NodeLogger.fmt(req));
                 }
                 AppendResponse resp = peer.getValue().withDeadlineAfter(300, TimeUnit.MILLISECONDS).appendEntries(req);
@@ -462,6 +516,10 @@ public class RaftNode {
             String command = log.get(lastApplied).getCommand();
             String result = kv.apply(command);
             print(result.startsWith("ERR") ? ERROR : APPLY, "apply " + lastApplied + ": \"" + command + "\" -> " + result);
+            CompletableFuture<String> waiting = pending.remove(lastApplied);
+            if (waiting != null) {
+                waiting.complete(result);   // wake up the client that waits for this index
+            }
         }
     }
 
@@ -578,5 +636,42 @@ public class RaftNode {
             sb.append(String.format(" %5d  %4d  %-9s  %s%n", i, e.getTerm(), status, e.getCommand()));
         }
         return sb.toString().stripTrailing();
+    }
+
+    /**
+     * Used by the terminal: if we are the leader we run the command here,
+     * otherwise we forward it to the leader with the ClientCommand RPC.
+     */
+    public CommandResponse execute(String command) {
+        String leader;
+        boolean amLeader;
+        synchronized (this) {
+            amLeader = (role == Role.LEADER);
+            leader = currentLeader;
+        }
+        if (amLeader) return submit(command);  // submit waits
+
+        if (leader == null) {
+            print(CLIENT,"\"" + command + "\" rejected: no leader known yet, try again");
+            return CommandResponse.newBuilder()
+                                  .setResult("no leader known yet, try again")
+                                  .setLeaderId("")
+                                  .build();
+        }
+
+        // here we do NOT hold the lock: the network call may take long
+        try {
+            CommandRequest req = CommandRequest.newBuilder().setCommand(command).build();
+            print(SEND, "-> " + leader + " " + NodeLogger.fmt(req));
+            CommandResponse resp = peers.get(leader).withDeadlineAfter(2, TimeUnit.SECONDS).clientCommand(req);
+            print(RECV, "<- " + leader + " " + NodeLogger.fmt(resp));
+            return resp;
+        } catch (StatusRuntimeException e) {
+            print(ERROR, "ClientCommand to " + leader + " failed: " + e.getStatus().getCode());
+            return CommandResponse.newBuilder()
+                                  .setResult("unknown outcome: the command may or may not have been applied")
+                                  .setLeaderId(leader)
+                                  .build();
+        }
     }
 }

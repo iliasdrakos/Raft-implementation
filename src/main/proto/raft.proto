@@ -25,6 +25,17 @@ message VoteResponse {
   bool  vote_granted = 2;
 }
 
+message CommandRequest {
+  string command = 1; // the command that we need to give to the leader
+}
+
+message CommandResponse {
+  bool success = 1; // if the command is valid
+  string result = 2; // the result of the command or the error
+  string leader_id = 3; // leaders id so we can print it
+  int64 index = 4; // what index of the log the command was saved
+}
+
 //leader -> followers (empty entries = heartbeat)
 message AppendRequest {
   int64    term           = 1;
@@ -43,4 +54,5 @@ message AppendResponse {
 service RaftService {
   rpc RequestVote   (VoteRequest)   returns (VoteResponse);
   rpc AppendEntries (AppendRequest) returns (AppendResponse);
+  rpc ClientCommand (CommandRequest) returns (CommandResponse);
 }

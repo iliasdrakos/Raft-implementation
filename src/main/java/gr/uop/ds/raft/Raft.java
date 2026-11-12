@@ -4,6 +4,7 @@ import java.io.BufferedReader;
 import java.io.InputStreamReader;
 import java.util.Map;
 
+import gr.uop.ds.raft.proto.CommandResponse;
 import io.grpc.Server;
 import io.grpc.ServerBuilder;
 
@@ -66,7 +67,12 @@ public class Raft {
             } else if (parts[0].equalsIgnoreCase("HELP")) {
                 printHelp();
             } else {
-                node.submit(line);   // PUT OR DEL go through Raft
+                CommandResponse r = node.execute(line);   // PUT OR DEL go through Raft
+                if(r.getSuccess()) {
+                    System.out.println("[" + nodeId + "] " + line + " -> " + r.getResult() + " (committed at index " + r.getIndex() + " by leader " + r.getLeaderId() + ")");
+                } else {
+                    System.out.println("[" + nodeId + "] " + line + " -> " + "FAILED: " + r.getResult());
+                }
             }
         }
         server.awaitTermination();
