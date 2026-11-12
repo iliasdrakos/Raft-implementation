@@ -15,9 +15,12 @@ import io.grpc.ServerBuilder;
  *   GET key        answered from this node's own KvStore (on a follower the value may be stale)
  *   PUT key value  goes to the log through submit(); only the leader accepts it
  *   DEL key        same as PUT
+ *   STATUS         the state of this node (role, term, leader, commit, peers)
+ *   LOG            every entry of the log and whether it is committed
+ *   VERBOSE on|off show or hide the empty heartbeats
  */
 public class Raft {
-    
+
     /**
      * The gRPC server starts BEFORE node.start(): as soon as our timers run we may send
      * or receive RPCs, so we must already be able to answer our peers.
@@ -34,6 +37,7 @@ public class Raft {
                 .build()
                 .start();
         System.out.println("[" + nodeId + "] listening on port " + port);
+        printHelp();
         node.start();
         // Temporary "client" to type commands in the leader's terminal, e.g. PUT x 5
         BufferedReader in = new BufferedReader(new InputStreamReader(System.in));
@@ -51,10 +55,24 @@ public class Raft {
                     System.out.println("[" + nodeId + "] " + parts[1] + " = "
                             + (value == null ? "(not found)" : value));
                 }
+            } else if (parts[0].equalsIgnoreCase("STATUS")) {
+                System.out.println(node.status());
+            } else if (parts[0].equalsIgnoreCase("LOG")) {
+                System.out.println(node.logView());
+            } else if (parts[0].equalsIgnoreCase("VERBOSE")) {
+                boolean on = parts.length < 2 || parts[1].equalsIgnoreCase("on");
+                node.setVerbose(on);
+                System.out.println("verbose " + (on ? "ON: empty heartbeats are shown" : "OFF"));
+            } else if (parts[0].equalsIgnoreCase("HELP")) {
+                printHelp();
             } else {
                 node.submit(line);   // PUT OR DEL go through Raft
             }
         }
         server.awaitTermination();
+    }
+
+    private static void printHelp() {
+        System.out.println("commands: PUT key value | DEL key | GET key | STATUS | LOG | VERBOSE on|off | HELP");
     }
 }
