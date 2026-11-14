@@ -57,7 +57,7 @@ public class RaftNode {
 
     // we change this values ONLY in a synchronized block or method
 
-    // Persistent state: implement later
+    // Persistent state: saved to disk before we answer
     private long currentTerm = 0;
     private String votedFor = null;
     private final RaftLog log;
@@ -84,6 +84,8 @@ public class RaftNode {
 
     // Logging only: not used by the algorithm
     private final NodeLogger out;
+    private final Stats stats = new Stats();   // counters for the experiments (STATS command)
+    private volatile boolean preVoteEnabled = false;   // PREVOTE on|off in the terminal
     private final Map<String, Boolean> peerUp = new HashMap<>(); // last known reachability, so we print only changes
     private long electionTimeoutMs;
     private long lastHeartbeatAt = System.currentTimeMillis();
@@ -94,9 +96,10 @@ public class RaftNode {
      * Also opens one gRPC channel to every other node of the cluster.
      * @param nodeId  the id of this node, e.g. "node1"
      * @param cluster all nodes of the cluster (id -> port), including this one
+     * @param faults the fault injector; every RPC we send passes through it
      * @throws IOException if the saved state cannot be read
      */
-    public RaftNode(String nodeId, Map<String, Integer> cluster) throws IOException {
+    public RaftNode(String nodeId, Map<String, Integer> cluster, FaultInjector faults) throws IOException {
         this.nodeId = nodeId;
         this.out = new NodeLogger(nodeId);
         this.storage = new PersistentState(nodeId);
@@ -107,7 +110,7 @@ public class RaftNode {
         for (var e : cluster.entrySet()) {
             if (e.getKey().equals(nodeId)) continue;
             ManagedChannel ch = ManagedChannelBuilder.forAddress("localhost", e.getValue())
-                    .usePlaintext().build();
+                    .usePlaintext().intercept(faults).build();
             channels.put(e.getKey(), ch);
             peers.put(e.getKey(), RaftServiceGrpc.newBlockingStub(ch));
         }
@@ -148,8 +151,15 @@ public class RaftNode {
             // persist BEFORE we answer anything in the new term
             storage.save(currentTerm, votedFor);
             role = Role.FOLLOWER;
+            if (oldRole == Role.LEADER) stats.steppedDown();
+            stats.leaderLost(System.currentTimeMillis());
+            lastHeartbeatAt = System.currentTimeMillis();
+            if (oldRole == Role.FOLLOWER) {
+                print(STATE, "term " + oldTerm + " -> " + term + ": " + from + " has a newer term");
+            } else {
+                print(STATE, oldRole + " -> FOLLOWER: " + from + " has newer term " + term + " (ours was " + oldTerm + ")");
+            }
             currentLeader = null;
-            print(STATE, oldRole + " -> FOLLOWER: " + from + " has newer term " + term + " (ours was " + oldTerm + ")");
             print(DISK, "saved state.txt: term=" + currentTerm + ", votedFor=none");
             if (oldRole == Role.LEADER) {
                 // we are not the leader anymore
@@ -209,6 +219,28 @@ public class RaftNode {
     }
 
     /**
+     * Pre-Vote (Ongaro's dissertation): a node asks "would you vote for me in term X?"
+     * before it really starts an election. We answer without changing anything:
+     * no new term, no votedFor, no timer reset.
+     */
+    public synchronized VoteResponse onPreVote(VoteRequest req) {
+        long now = System.currentTimeMillis();
+        boolean heardFromLeaderRecently =
+                role == Role.LEADER || (currentLeader != null && now - lastHeartbeatAt < 1500);
+        boolean grant = req.getTerm() >= currentTerm
+        && log.isUpToDate(req.getLastLogTerm(), req.getLastLogIndex())
+        && !heardFromLeaderRecently;
+
+        print(VOTE, "PRE-VOTE " + (grant ? "yes" : "no") + " to " + req.getCandidateId()
+                + " for term " + req.getTerm()
+                + (heardFromLeaderRecently ? " (we have a leader)" : ""));
+        return VoteResponse.newBuilder()
+                .setTerm(currentTerm)
+                .setVoteGranted(grant)
+                .build();
+    }
+
+    /**
      * Handles an AppendEntries RPC from a leader. It is both the heartbeat (no entries)
      * and the way the leader replicates its log.
      * A request from an older term is rejected, so the old leader learns our term and steps down.
@@ -239,6 +271,7 @@ public class RaftNode {
                 print(STATE, "following leader " + leader + " (term " + req.getTerm() + ")");
             }
             currentLeader = req.getLeaderId();
+            stats.leaderFound();
             lastHeartbeatAt = System.currentTimeMillis();
             resetElectionTimer(); // the leader is alive, so we must not start an election
             long ourPrevTerm = log.termAt(req.getPrevLogIndex());
@@ -306,6 +339,7 @@ public class RaftNode {
             index = log.lastIndex() + 1;
             log.append(LogEntry.newBuilder().setIndex(index).setTerm(currentTerm).setCommand(command).build());
             pending.put(index, future);
+            stats.appended(index);
             print(CLIENT, "\"" + command + "\" appended at index " + index + " (term " + currentTerm
                     + "), saved to log.bin, waiting for a majority");
             
@@ -343,16 +377,72 @@ public class RaftNode {
                                   
     }
 
+    // Pre-Vote: asks the others if they WOULD vote for us in term currentTerm + 1.
+    // Our term stays the same, so a node that is cut off can never raise it.
+    private boolean preVote() {
+        long proposedTerm;
+        long lastLogIndex;
+        long lastLogTerm;
+        synchronized (this) {
+            if (role == Role.LEADER) return false;
+            proposedTerm = currentTerm + 1;
+            lastLogIndex = log.lastIndex();
+            lastLogTerm = log.lastTerm();
+            print(ELECT, "election timeout: PRE-VOTE for term " + proposedTerm + " (our term stays " + currentTerm + ")");
+            resetElectionTimer();   // if the pre-vote fails, we try again after the next timeout
+        }
+
+        int yes = 1;   // we would vote for ourselves
+        List<String> granted = new ArrayList<>(List.of(nodeId));
+        for (var peer : peers.entrySet()) {
+            String id = peer.getKey();
+            try {
+                VoteRequest req = VoteRequest.newBuilder()
+                        .setTerm(proposedTerm)
+                        .setCandidateId(nodeId)
+                        .setLastLogIndex(lastLogIndex)
+                        .setLastLogTerm(lastLogTerm)
+                        .build();
+                print(SEND, "-> " + id + " PreVote " + NodeLogger.fmt(req));
+                VoteResponse resp = peer.getValue().withDeadlineAfter(300, TimeUnit.MILLISECONDS).preVote(req);
+                markPeer(id, true, null);
+                print(RECV, "<- " + id + " PreVote answer " + NodeLogger.fmt(resp));
+                if (resp.getTerm() > proposedTerm - 1) {
+                    stepDownIfNewerTerm(resp.getTerm(), id);   // no election
+                    return false;
+                }
+                if (resp.getVoteGranted()) {
+                    yes++;
+                    granted.add(id);
+                }
+            } catch (StatusRuntimeException e) {
+                markPeer(id, false, e.getStatus().getCode().toString());
+                print(ERROR, "PreVote to " + id + " failed: " + e.getStatus().getCode());
+                channels.get(id).resetConnectBackoff();
+            }
+        }
+
+        int majority = (peers.size() + 1) / 2 + 1;
+        boolean passed = yes >= majority;
+        if (!passed) stats.preVoteFailed();
+        print(ELECT, passed
+                ? "PRE-VOTE passed with " + yes + "/" + (peers.size() + 1) + " " + granted + " -> real election"
+                : "PRE-VOTE failed: " + yes + "/" + (peers.size() + 1) + " " + granted + " -> we do NOT raise our term");
+        return passed;
+    }
+
     /**
      * The startElection method is called from the timer of this node because
      * he didn't hear the leader from the timeout and the need to elect one.
      * **/
     private void startElection() {
+        if (preVoteEnabled && !preVote()) return;  // first ask, then elect
         long electionTerm;
         long lastLogIndex;
         long lastLogTerm;
         synchronized (this) {
             if (role == Role.LEADER) { resetElectionTimer(); return; } // I am already the leader
+            if (preVoteEnabled && currentLeader != null && System.currentTimeMillis() - lastHeartbeatAt < 1500) return;  // while we were asking for pre-votes, a leader may have contacted us: then no election
             long silence = System.currentTimeMillis() - lastHeartbeatAt;
             print(ELECT, "election timeout (" + electionTimeoutMs + " ms): no heartbeat from "
                     + (currentLeader == null ? "any leader" : "leader " + currentLeader) + " for " + silence + " ms");
@@ -360,6 +450,8 @@ public class RaftNode {
             currentTerm++;
             role = Role.CANDIDATE;
             votedFor = nodeId;
+            stats.electionStarted();
+            if (currentLeader != null) stats.leaderLost(lastHeartbeatAt);   // without leader since its last heartbeat
             currentLeader = null;
             storage.save(currentTerm, votedFor); // writing in the disk
             lastLogIndex = log.lastIndex();
@@ -516,6 +608,7 @@ public class RaftNode {
             String command = log.get(lastApplied).getCommand();
             String result = kv.apply(command);
             print(result.startsWith("ERR") ? ERROR : APPLY, "apply " + lastApplied + ": \"" + command + "\" -> " + result);
+            stats.applied(lastApplied);
             CompletableFuture<String> waiting = pending.remove(lastApplied);
             if (waiting != null) {
                 waiting.complete(result);   // wake up the client that waits for this index
@@ -529,6 +622,8 @@ public class RaftNode {
      */
     // must be called while holding the lock
     private void becomeLeader() {
+        stats.electionWon();
+        stats.leaderFound();
         Role oldRole = role;
         role = Role.LEADER;
         currentLeader = nodeId;
@@ -602,6 +697,10 @@ public class RaftNode {
         out.setVerbose(verbose);
     }
 
+    public void setPreVote(boolean enabled) {
+        preVoteEnabled = enabled;
+    }
+
     /** The STATUS command: a small table with the whole state of this node. */
     public synchronized String status() {
         StringBuilder sb = new StringBuilder();
@@ -673,5 +772,13 @@ public class RaftNode {
                                   .setLeaderId(leader)
                                   .build();
         }
+    }
+
+    public synchronized String statsReport() {
+        return stats.report(nodeId, currentTerm);
+    }
+
+    public synchronized void resetStats() {
+        stats.reset(currentLeader != null);
     }
 }

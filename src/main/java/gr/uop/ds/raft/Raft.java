@@ -7,6 +7,7 @@ import java.util.Map;
 import gr.uop.ds.raft.proto.CommandResponse;
 import io.grpc.Server;
 import io.grpc.ServerBuilder;
+import io.grpc.ServerInterceptors;
 
 
 /**
@@ -31,10 +32,10 @@ public class Raft {
         Map<String, Integer> cluster = Map.of("node1", 50051, "node2", 50052, "node3", 50053);
         String nodeId = args.length > 0 ? args[0] : "node1";
         int port = cluster.get(nodeId);
-
-        RaftNode node = new RaftNode(nodeId, cluster);
+        FaultInjector faults = new FaultInjector();
+        RaftNode node = new RaftNode(nodeId, cluster,faults);
         Server server = ServerBuilder.forPort(port)
-                .addService(new RaftServiceImpl(node))
+                .addService(ServerInterceptors.intercept(new RaftServiceImpl(node), faults))
                 .build()
                 .start();
         System.out.println("[" + nodeId + "] listening on port " + port);
@@ -48,37 +49,80 @@ public class Raft {
             if (line.isEmpty()) continue;
 
             String[] parts = line.split("\\s+", 2);
-            if (parts[0].equalsIgnoreCase("GET")) {
-                if (parts.length < 2) {
-                    System.out.println("usage: GET key");
-                } else {
-                    String value = node.localGet(parts[1]);
-                    System.out.println("[" + nodeId + "] " + parts[1] + " = "
-                            + (value == null ? "(not found)" : value));
+            String arg = parts.length > 1 ? parts[1] : null;   // what comes after the command, or null
+
+            switch (parts[0].toUpperCase()) {
+                case "GET" -> {
+                    if (arg == null) {
+                        System.out.println("usage: GET key");
+                    } else {
+                        String value = node.localGet(arg);
+                        System.out.println("[" + nodeId + "] " + arg + " = " + (value == null ? "(not found)" : value));
+                    }
                 }
-            } else if (parts[0].equalsIgnoreCase("STATUS")) {
-                System.out.println(node.status());
-            } else if (parts[0].equalsIgnoreCase("LOG")) {
-                System.out.println(node.logView());
-            } else if (parts[0].equalsIgnoreCase("VERBOSE")) {
-                boolean on = parts.length < 2 || parts[1].equalsIgnoreCase("on");
-                node.setVerbose(on);
-                System.out.println("verbose " + (on ? "ON: empty heartbeats are shown" : "OFF"));
-            } else if (parts[0].equalsIgnoreCase("HELP")) {
-                printHelp();
-            } else {
-                CommandResponse r = node.execute(line);   // PUT OR DEL go through Raft
-                if(r.getSuccess()) {
-                    System.out.println("[" + nodeId + "] " + line + " -> " + r.getResult() + " (committed at index " + r.getIndex() + " by leader " + r.getLeaderId() + ")");
-                } else {
-                    System.out.println("[" + nodeId + "] " + line + " -> " + "FAILED: " + r.getResult());
+                case "PUT", "DEL" -> {
+                    CommandResponse r = node.execute(line);   // PUT OR DEL go through Raft
+                    if (r.getSuccess()) {
+                        System.out.println("[" + nodeId + "] " + line + " -> " + r.getResult()
+                                + " (committed at index " + r.getIndex() + " by leader " + r.getLeaderId() + ")");
+                    } else {
+                        System.out.println("[" + nodeId + "] " + line + " -> FAILED: " + r.getResult());
+                    }
                 }
+                case "STATUS" -> System.out.println(node.status());
+                case "LOG" -> System.out.println(node.logView());
+                case "STATS" -> {
+                    if ("reset".equalsIgnoreCase(arg)) {
+                        node.resetStats();
+                        System.out.println("[" + nodeId + "] stats reset");
+                    } else {
+                        System.out.println(node.statsReport());
+                    }
+                }
+                case "VERBOSE" -> {
+                    boolean on = arg == null || arg.equalsIgnoreCase("on");
+                    node.setVerbose(on);
+                    System.out.println("verbose " + (on ? "ON: empty heartbeats are shown" : "OFF"));
+                }
+                case "PREVOTE" -> {
+                    boolean on = arg == null || arg.equalsIgnoreCase("on");
+                    node.setPreVote(on);
+                    System.out.println("[" + nodeId + "] pre-vote " + (on ? "ON" : "OFF"));
+                }
+                case "FAULT" -> handleFault(nodeId, faults, arg);
+                case "CRASH" -> Runtime.getRuntime().halt(1);
+                case "HELP" -> printHelp();
+                default -> System.out.println("unknown command: " + parts[0] + " (type HELP)");
             }
         }
         server.awaitTermination();
     }
 
+    // FAULT [isolate [seconds] | drop <percent> | delay <ms> | off]
+    private static void handleFault(String nodeId, FaultInjector faults, String arg) {
+        if (arg != null) {
+            String[] f = arg.split("\\s+");   // e.g. ["drop", "30"]
+            try {
+                switch (f[0].toLowerCase()) {
+                    case "isolate" -> {
+                        if (f.length == 2) {
+                            faults.isolateFor(Long.parseLong(f[1]));   // FAULT isolate 20
+                        } else {
+                            faults.isolate();                           // until FAULT off
+                        }
+                    }
+                    case "off" -> faults.off();
+                    case "drop" -> faults.drop(Integer.parseInt(f[1]));
+                    case "delay" -> faults.delay(Long.parseLong(f[1]));
+                    default -> System.out.println("usage: FAULT [isolate [seconds] | drop <percent> | delay <ms> | off]");
+                }
+            } catch (NumberFormatException | ArrayIndexOutOfBoundsException e) {
+                System.out.println("usage: FAULT [isolate [seconds] | drop <percent> | delay <ms> | off]");
+            }
+        }
+        System.out.println("[" + nodeId + "] faults: " + faults.describe());
+    }
     private static void printHelp() {
-        System.out.println("commands: PUT key value | DEL key | GET key | STATUS | LOG | VERBOSE on|off | HELP");
+        System.out.println("commands: PUT key value | DEL key | GET key | STATUS | LOG | VERBOSE on|off | HELP | FAULT [isolate|drop N|delay MS|off] | CRASH | STATS [reset]");
     }
 }

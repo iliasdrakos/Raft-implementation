@@ -49,4 +49,14 @@ public class RaftServiceImpl extends RaftServiceGrpc.RaftServiceImplBase {
         out.onNext(node.submit(req.getCommand()));
         out.onCompleted();
     }
+
+    /**    
+     * Called by gRPC when another node asks if we WOULD vote for it (Pre-Vote), 
+     * so that a node that was cut off cannot disrupt the cluster when it comes back.
+     */
+    @Override 
+    public void preVote(VoteRequest req, StreamObserver<VoteResponse> out) {
+        out.onNext(node.onPreVote(req));
+        out.onCompleted();
+    }
 }
