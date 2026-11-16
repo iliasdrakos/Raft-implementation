@@ -4,9 +4,11 @@ import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
@@ -38,7 +40,9 @@ import gr.uop.ds.raft.proto.VoteRequest;
 import gr.uop.ds.raft.proto.VoteResponse;
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
+import io.grpc.Status;
 import io.grpc.StatusRuntimeException;
+import io.grpc.stub.StreamObserver;
 
 /**
  * One server of the Raft cluster.
@@ -85,10 +89,16 @@ public class RaftNode {
     // Logging only: not used by the algorithm
     private final NodeLogger out;
     private final Stats stats = new Stats();   // counters for the experiments (STATS command)
-    private volatile boolean preVoteEnabled = false;   // PREVOTE on|off in the terminal
+    private volatile boolean preVoteEnabled = Boolean.parseBoolean(System.getProperty("raft.prevote", "true"));   // PREVOTE on|off, or -Draft.prevote=false
     private final Map<String, Boolean> peerUp = new HashMap<>(); // last known reachability, so we print only changes
     private long electionTimeoutMs;
     private long lastHeartbeatAt = System.currentTimeMillis();
+    private final Map<String, RaftServiceGrpc.RaftServiceStub> asyncPeers = new LinkedHashMap<>(); // non-blocking stubs: the answer arrives later in a callback
+    private final Set<String> votesGranted = new HashSet<>(); // who voted for us in the current election (only while CANDIDATE)
+    private int votesAnswered;                                 // how many peers answered or failed in the current election
+    private long preVoteTerm = 0;                                 // the term our running pre-vote asks for (0 = no pre-vote running)
+    private final Set<String> preVotesGranted = new HashSet<>(); // who said "yes" in the running pre-vote
+    private int preVotesAnswered;                                 // how many peers answered or failed in the running pre-vote
 
     /**
      * Creates the node as a FOLLOWER and restores currentTerm and votedFor from disk,
@@ -112,7 +122,9 @@ public class RaftNode {
             ManagedChannel ch = ManagedChannelBuilder.forAddress("localhost", e.getValue())
                     .usePlaintext().intercept(faults).build();
             channels.put(e.getKey(), ch);
+            ch.getState(true);
             peers.put(e.getKey(), RaftServiceGrpc.newBlockingStub(ch));
+            asyncPeers.put(e.getKey(), RaftServiceGrpc.newStub(ch));
         }
         print(DISK, "loaded state.txt: term=" + currentTerm + ", votedFor=" + (votedFor == null ? "none" : votedFor));
         print(DISK, "loaded log.bin: " + log.lastIndex() + " entries (last " + log.lastIndex() + "/t" + log.lastTerm() + ")");
@@ -134,7 +146,7 @@ public class RaftNode {
         if (electionTimer != null) electionTimer.cancel(false);
         long timeout = 1500 + ThreadLocalRandom.current().nextLong(1500);  //1.5–3 s while testing
         electionTimeoutMs = timeout;
-        electionTimer = scheduler.schedule(this::startElection, timeout, TimeUnit.MILLISECONDS);
+        electionTimer = scheduler.schedule(this::onElectionTimeout, timeout, TimeUnit.MILLISECONDS);
     }
 
     /**
@@ -216,6 +228,50 @@ public class RaftNode {
         }
         print(SEND, "-> " + candidate + " " + NodeLogger.fmt(rsp));
         return rsp;
+    }
+
+    /** A peer answered our RequestVote. Runs on a gRPC thread, so it takes the lock. */
+    private synchronized void onVoteResponse(String peer, long electionTerm, VoteResponse resp) {
+        markPeer(peer, true, null);
+        print(RECV, "<- " + peer + " " + NodeLogger.fmt(resp));
+        if (resp.getTerm() > currentTerm) {
+            stepDownIfNewerTerm(resp.getTerm(), peer);   // the term of the ANSWER, even if the answer is late
+            return;
+        }
+        if (role != Role.CANDIDATE || currentTerm != electionTerm) {
+            return;   // a late answer from an old election, or we already won
+        }
+        votesAnswered++;
+        if (resp.getVoteGranted()) {
+            votesGranted.add(peer);
+            int majority = (peers.size() + 1) / 2 + 1;
+            if (votesGranted.size() >= majority) {
+                print(ELECT, "WON term " + electionTerm + " with " + votesGranted.size() + "/" + (peers.size() + 1)
+                        + " votes " + votesGranted);
+                becomeLeader();
+                return;
+            }
+        }
+        checkElectionOver(electionTerm);
+    }
+
+    /** Our RequestVote to this peer failed (down, too slow, or dropped by the FaultInjector). */
+    private synchronized void onVoteFailed(String peer, long electionTerm, String why) {
+        markPeer(peer, false, why);
+        print(ERROR, "RequestVote to " + peer + " failed: " + why);
+        channels.get(peer).resetConnectBackoff();
+        if (role != Role.CANDIDATE || currentTerm != electionTerm) return;   // old election
+        votesAnswered++;
+        checkElectionOver(electionTerm);
+    }
+
+    // must be called while holding the lock
+    // prints NO MAJORITY once, when every peer has answered and we still have not won
+    private void checkElectionOver(long electionTerm) {
+        if(role == Role.CANDIDATE && currentTerm == electionTerm && votesAnswered == peers.size()) {
+            print(ELECT, "NO MAJORITY in term " + electionTerm + ": " + votesGranted.size() + "/" + (peers.size() + 1)
+            + " votes " + votesGranted + " -> new election after the next timeout");
+        }  
     }
 
     /**
@@ -377,58 +433,89 @@ public class RaftNode {
                                   
     }
 
-    // Pre-Vote: asks the others if they WOULD vote for us in term currentTerm + 1.
+    // Pre-Vote: asks every peer at the same time if they WOULD vote for us in term currentTerm + 1.
     // Our term stays the same, so a node that is cut off can never raise it.
-    private boolean preVote() {
+    private void startPreVote() {
         long proposedTerm;
-        long lastLogIndex;
-        long lastLogTerm;
+        VoteRequest req;
         synchronized (this) {
-            if (role == Role.LEADER) return false;
+            if (role == Role.LEADER) return;
             proposedTerm = currentTerm + 1;
-            lastLogIndex = log.lastIndex();
-            lastLogTerm = log.lastTerm();
-            print(ELECT, "election timeout: PRE-VOTE for term " + proposedTerm + " (our term stays " + currentTerm + ")");
+            print(ELECT, "election timeout (" + electionTimeoutMs + " ms): no heartbeat from "
+                    + (currentLeader == null ? "any leader" : "leader " + currentLeader) + " for "
+                    + (System.currentTimeMillis() - lastHeartbeatAt) + " ms -> PRE-VOTE for term " + proposedTerm);
+            preVoteTerm = proposedTerm;
+            preVotesGranted.clear();
+            preVotesAnswered = 0;
+            preVotesGranted.add(nodeId);
+            req = VoteRequest.newBuilder()
+                    .setTerm(proposedTerm)
+                    .setCandidateId(nodeId)
+                    .setLastLogIndex(log.lastIndex())
+                    .setLastLogTerm(log.lastTerm())
+                    .build();
             resetElectionTimer();   // if the pre-vote fails, we try again after the next timeout
         }
+        // outside the lock, like startElection
+        for (String id : asyncPeers.keySet()) {
+            print(SEND, "-> " + id + " PreVote " + NodeLogger.fmt(req));
+            asyncPeers.get(id).withDeadlineAfter(300, TimeUnit.MILLISECONDS)
+                    .preVote(req, new StreamObserver<VoteResponse>() {
+                        @Override public void onNext(VoteResponse resp) { onPreVoteResponse(id, proposedTerm, resp); }
+                        @Override public void onError(Throwable t) {
+                            onPreVoteFailed(id, proposedTerm, Status.fromThrowable(t).getCode().toString());
+                        }
+                        @Override public void onCompleted() { }
+                    });
+        }
+    }
 
-        int yes = 1;   // we would vote for ourselves
-        List<String> granted = new ArrayList<>(List.of(nodeId));
-        for (var peer : peers.entrySet()) {
-            String id = peer.getKey();
-            try {
-                VoteRequest req = VoteRequest.newBuilder()
-                        .setTerm(proposedTerm)
-                        .setCandidateId(nodeId)
-                        .setLastLogIndex(lastLogIndex)
-                        .setLastLogTerm(lastLogTerm)
-                        .build();
-                print(SEND, "-> " + id + " PreVote " + NodeLogger.fmt(req));
-                VoteResponse resp = peer.getValue().withDeadlineAfter(300, TimeUnit.MILLISECONDS).preVote(req);
-                markPeer(id, true, null);
-                print(RECV, "<- " + id + " PreVote answer " + NodeLogger.fmt(resp));
-                if (resp.getTerm() > proposedTerm - 1) {
-                    stepDownIfNewerTerm(resp.getTerm(), id);   // no election
-                    return false;
-                }
-                if (resp.getVoteGranted()) {
-                    yes++;
-                    granted.add(id);
-                }
-            } catch (StatusRuntimeException e) {
-                markPeer(id, false, e.getStatus().getCode().toString());
-                print(ERROR, "PreVote to " + id + " failed: " + e.getStatus().getCode());
-                channels.get(id).resetConnectBackoff();
+    /** A peer answered our PreVote. Runs on a gRPC thread, so it takes the lock. */
+    private synchronized void onPreVoteResponse(String peer, long proposedTerm, VoteResponse resp) {
+        markPeer(peer, true, null);
+        print(RECV, "<- " + peer + " PreVote answer " + NodeLogger.fmt(resp));
+        if(resp.getTerm() > currentTerm) {
+            stepDownIfNewerTerm(resp.getTerm(), peer);
+            preVoteTerm = 0; // close the pre-vote
+            return;
+        } else if (preVoteTerm != proposedTerm || currentTerm != proposedTerm - 1) {
+            return;   // stale answer from an old pre-vote, or our term changed meanwhile
+        }
+        preVotesAnswered++;
+        if (resp.getVoteGranted()) {
+            preVotesGranted.add(peer);
+            int majority = (peers.size() + 1) / 2 + 1;
+            if (preVotesGranted.size() >= majority) {
+                print(ELECT, "PRE-VOTE passed for term " + proposedTerm + " with "
+                        + preVotesGranted.size() + "/" + (peers.size() + 1) + " votes " + preVotesGranted);
+                preVoteTerm = 0; // close the pre-vote
+                scheduler.execute(this::startElection); // NOT a direct call: we hold the lock
+                return;
             }
         }
+        checkPreVoteOver(proposedTerm);
+    }
 
-        int majority = (peers.size() + 1) / 2 + 1;
-        boolean passed = yes >= majority;
-        if (!passed) stats.preVoteFailed();
-        print(ELECT, passed
-                ? "PRE-VOTE passed with " + yes + "/" + (peers.size() + 1) + " " + granted + " -> real election"
-                : "PRE-VOTE failed: " + yes + "/" + (peers.size() + 1) + " " + granted + " -> we do NOT raise our term");
-        return passed;
+    /** Our PreVote to this peer failed (down, too slow, or dropped by the FaultInjector). */
+    private synchronized void onPreVoteFailed(String peer, long proposedTerm, String why) {
+        markPeer(peer, false, why);
+        print(ERROR, "PreVote to " + peer + " failed: " + why);
+        channels.get(peer).resetConnectBackoff();   // always, so the next call can reconnect at once
+        if (preVoteTerm != proposedTerm || currentTerm != proposedTerm - 1) return;   // old pre-vote: nothing to count
+        preVotesAnswered++;
+        checkPreVoteOver(proposedTerm);
+    }
+
+    // must be called while holding the lock
+    // once every peer has answered and we still have no majority: the pre-vote failed
+    private void checkPreVoteOver(long proposedTerm) {
+        if(preVoteTerm == proposedTerm && preVotesAnswered == peers.size()) {
+            print(ELECT, "PRE-VOTE failed for term " + proposedTerm + ": "
+                    + preVotesGranted.size() + "/" + (peers.size() + 1) + " votes " + preVotesGranted
+                    + " -> we do not raise our term");
+            stats.preVoteFailed();
+            preVoteTerm = 0; // close the pre-vote
+        }
     }
 
     /**
@@ -436,16 +523,16 @@ public class RaftNode {
      * he didn't hear the leader from the timeout and the need to elect one.
      * **/
     private void startElection() {
-        if (preVoteEnabled && !preVote()) return;  // first ask, then elect
         long electionTerm;
-        long lastLogIndex;
-        long lastLogTerm;
+        VoteRequest req;
         synchronized (this) {
             if (role == Role.LEADER) { resetElectionTimer(); return; } // I am already the leader
             if (preVoteEnabled && currentLeader != null && System.currentTimeMillis() - lastHeartbeatAt < 1500) return;  // while we were asking for pre-votes, a leader may have contacted us: then no election
             long silence = System.currentTimeMillis() - lastHeartbeatAt;
-            print(ELECT, "election timeout (" + electionTimeoutMs + " ms): no heartbeat from "
-                    + (currentLeader == null ? "any leader" : "leader " + currentLeader) + " for " + silence + " ms");
+            if (!preVoteEnabled) {
+                print(ELECT, "election timeout (" + electionTimeoutMs + " ms): no heartbeat from "
+                        + (currentLeader == null ? "any leader" : "leader " + currentLeader) + " for " + silence + " ms");
+            }
             Role oldRole = role;
             currentTerm++;
             role = Role.CANDIDATE;
@@ -454,67 +541,39 @@ public class RaftNode {
             if (currentLeader != null) stats.leaderLost(lastHeartbeatAt);   // without leader since its last heartbeat
             currentLeader = null;
             storage.save(currentTerm, votedFor); // writing in the disk
-            lastLogIndex = log.lastIndex();
-            lastLogTerm  = log.lastTerm();
+            votesGranted.clear();
+            votesGranted.add(nodeId);
+            votesAnswered = 0;
+            req = VoteRequest.newBuilder()
+                    .setTerm(currentTerm)
+                    .setCandidateId(nodeId)
+                    .setLastLogIndex(log.lastIndex())
+                    .setLastLogTerm(log.lastTerm())
+                    .build();
             electionTerm = currentTerm;
             print(STATE, oldRole + " -> CANDIDATE: starting election for term " + electionTerm + ", voted for myself");
             print(DISK, "saved state.txt: term=" + currentTerm + ", votedFor=" + nodeId);
             resetElectionTimer();   //if the Voting ends with a tie then we try again later
         }
-
-        int votes = 1;   // my vote
-        List<String> granted = new ArrayList<>(List.of(nodeId));
-        List<String> denied = new ArrayList<>();
-        List<String> unreachable = new ArrayList<>();
-        for (var peer : peers.entrySet()) { // we sent to every peer the VoteRequest to vote
-            String id = peer.getKey();
-            try {
-                VoteRequest req = VoteRequest.newBuilder()
-                        .setTerm(electionTerm)
-                        .setCandidateId(nodeId)
-                        .setLastLogIndex(lastLogIndex)
-                        .setLastLogTerm(lastLogTerm)
-                        .build();
-                print(SEND, "-> " + id + " " + NodeLogger.fmt(req));
-                VoteResponse resp = peer.getValue().withDeadlineAfter(300, TimeUnit.MILLISECONDS).requestVote(req);
-                markPeer(id, true, null);
-                print(RECV, "<- " + id + " " + NodeLogger.fmt(resp));
-                if(resp.getTerm() > electionTerm) { //if he has a newer term step me down
-                    stepDownIfNewerTerm(resp.getTerm(), id);
-                    return;
-                } else if(resp.getVoteGranted()) { // vote granted
-                    votes++;
-                    granted.add(id);
-                } else {
-                    denied.add(id);
-                }
-            } catch (StatusRuntimeException e) { // did not make it in time
-                // the peer is down or too slow, so no vote from it; resetConnectBackoff() lets us reconnect at once when it comes back
-                unreachable.add(id);
-                markPeer(id, false, e.getStatus().getCode().toString());
-                print(ERROR, "RequestVote to " + id + " failed: " + e.getStatus().getCode());
-                channels.get(id).resetConnectBackoff();
-            }
+        
+        // outside the lock: ask every peer at the same time, nobody waits for anybody
+        for (String id : asyncPeers.keySet()) {
+            print(SEND, "-> " + id + " " + NodeLogger.fmt(req));
+            asyncPeers.get(id).withDeadlineAfter(300, TimeUnit.MILLISECONDS)
+                    .requestVote(req, new StreamObserver<VoteResponse>() {
+                        @Override public void onNext(VoteResponse resp) { onVoteResponse(id, electionTerm, resp); }
+                        @Override public void onError(Throwable t) {
+                            onVoteFailed(id, electionTerm, Status.fromThrowable(t).getCode().toString());
+                        }
+                        @Override public void onCompleted() { }
+                    });
         }
+    }
 
-        // we released the lock during the RPCs, so re-check that we are still a candidate in the same term
-        synchronized (this) {
-            int majority = (peers.size() + 1) / 2 + 1;
-            int clusterSize = peers.size() + 1;
-            if(role == Role.CANDIDATE && currentTerm == electionTerm && votes >= majority) { // checking who got the majority of the votes
-                print(ELECT, "WON term " + electionTerm + " with " + votes + "/" + clusterSize + " votes " + granted);
-                becomeLeader();
-            } else if (role == Role.CANDIDATE && currentTerm == electionTerm) {
-                print(ELECT, "NO MAJORITY in term " + electionTerm + ": " + votes + "/" + clusterSize + " votes " + granted
-                        + ", need " + majority
-                        + (denied.isEmpty() ? "" : ", denied by " + denied + " (split vote or our log is behind)")
-                        + (unreachable.isEmpty() ? "" : ", unreachable " + unreachable)
-                        + " -> new election after the next timeout");
-            } else {
-                print(ELECT, "election of term " + electionTerm + " is over: we are now " + role
-                        + (currentLeader == null ? "" : ", leader is " + currentLeader));
-            }
-        }
+    // the election timer fired: with Pre-Vote we first ask, otherwise we start the election at once
+    private void onElectionTimeout() {
+        if (preVoteEnabled) startPreVote();
+        else startElection();
     }
 
     // Heartbeats (only the leader)
@@ -622,6 +681,7 @@ public class RaftNode {
      */
     // must be called while holding the lock
     private void becomeLeader() {
+        scheduler.execute(this::sendHeartbeatsIfLeader);   // tell the followers now, not at the next 500 ms tick
         stats.electionWon();
         stats.leaderFound();
         Role oldRole = role;

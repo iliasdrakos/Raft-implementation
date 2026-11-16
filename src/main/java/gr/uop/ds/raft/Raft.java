@@ -85,9 +85,15 @@ public class Raft {
                     System.out.println("verbose " + (on ? "ON: empty heartbeats are shown" : "OFF"));
                 }
                 case "PREVOTE" -> {
-                    boolean on = arg == null || arg.equalsIgnoreCase("on");
-                    node.setPreVote(on);
-                    System.out.println("[" + nodeId + "] pre-vote " + (on ? "ON" : "OFF"));
+                    if(arg != null && (arg.equalsIgnoreCase("on") || arg.equalsIgnoreCase("off"))) {
+                        boolean on = arg.equalsIgnoreCase("on");
+                        node.setPreVote(on);
+                        System.out.println("[" + nodeId + "] pre-vote " + (on ? "ON" : "OFF"));
+                    } else {
+                        System.out.println("For the PREVOTE command you need to type ON|OFF");
+                    }
+                   
+                    
                 }
                 case "FAULT" -> handleFault(nodeId, faults, arg);
                 case "CRASH" -> Runtime.getRuntime().halt(1);

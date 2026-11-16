@@ -92,9 +92,9 @@ mvn test
 **Cluster 3 κόμβων:** τρία ξεχωριστά terminals.
 
 ```bash
-mvn -q exec:java "-Dexec.mainClass=gr.uop.ds.raft.Raft" "-Dexec.args=node1"
-mvn -q exec:java "-Dexec.mainClass=gr.uop.ds.raft.Raft" "-Dexec.args=node2"
-mvn -q exec:java "-Dexec.mainClass=gr.uop.ds.raft.Raft" "-Dexec.args=node3"
+mvn -q exec:java "-Dexec.mainClass=gr.uop.ds.raft.Raft" "-Draft.prevote=true" "-Dexec.args=node1"
+mvn -q exec:java "-Dexec.mainClass=gr.uop.ds.raft.Raft" "-Draft.prevote=true" "-Dexec.args=node2"
+mvn -q exec:java "-Dexec.mainClass=gr.uop.ds.raft.Raft" "-Draft.prevote=true" "-Dexec.args=node3"
 ```
 
 Στο terminal κάθε κόμβου μπορείς να γράψεις:
