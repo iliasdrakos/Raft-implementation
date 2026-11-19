@@ -144,31 +144,45 @@ public class Raft {
     /** sends n PUTs one after the other and prints the latency the client sees. */
     private static void runBench(RaftNode node, int n) {
         List<Long> all = new ArrayList<>();   // latency of every request in ms, failures included
-        int ok = 0, unknown = 0, rejected = 0;
+        int ok = 0, unknown = 0, rejected = 0 , retries = 0;
         long start = System.nanoTime();       // a clock that never jumps, made for measuring durations
         for (int i = 0; i < n; i++) {
+            String cmd = "PUT bench" + i + " " + i;
             long t0 = System.nanoTime();
-            CommandResponse r = node.execute("PUT bench" + i + " " + i);
-            all.add((System.nanoTime() - t0) / 1_000_000);
-            if(r.getSuccess()) {
+            CommandResponse r;
+            while (true) {
+                r = node.execute(cmd);
+                boolean unknownOutcome = r.getResult().startsWith("timeout") || r.getResult().startsWith("unknown outcome");
+                boolean surelyNotApplied = !r.getSuccess() && !unknownOutcome;   // "no leader known", "not the leader"
+                if (!surelyNotApplied || (System.nanoTime() - t0) / 1_000_000 > 5000) break;   // done, or give up after 5 s
+                retries++;
+                try {
+                    Thread.sleep(50);   // the cluster may be electing a leader: wait a little and ask again
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+            all.add((System.nanoTime() - t0) / 1_000_000);   // includes the waiting
+            if (r.getSuccess()) {
                 ok++;
-            } else if(r.getResult().startsWith("timeout") || r.getResult().startsWith("unknown outcome")) {
+            } else if (r.getResult().startsWith("timeout") || r.getResult().startsWith("unknown outcome")) {
                 unknown++;
             } else {
-                rejected++;
+                rejected++;   // gave up after 5 s
             }
 
         }
         double seconds = (System.nanoTime() - start) / 1e9;
         Collections.sort(all);
         double avg = all.stream().mapToLong(Long::longValue).average().orElse(0);
-        System.out.printf("[%s] BENCH n=%d: ok=%d, unknown=%d, rejected=%d in %.1f s, throughput=%.1f PUT/s%n",
-                node.getNodeId(), n, ok, unknown, rejected, seconds, ok / seconds);
+        System.out.printf("[%s] BENCH n=%d: ok=%d, unknown=%d, retries=%d, rejected=%d in %.1f s, throughput=%.1f PUT/s%n",
+                node.getNodeId(), n, ok, unknown, retries, rejected, seconds, ok / seconds);
         System.out.printf("        latency (ms): avg=%.1f  p50=%d  p95=%d  p99=%d  max=%d%n",
                 avg, percentile(all, 0.50), percentile(all, 0.95), percentile(all, 0.99), all.get(all.size() - 1));
     }
 
-    // nearest-rank percentile: the smallest value that at least q of the samples are below or equal to (q in (0,1])
+    // the smallest value that at least q of the samples are below or equal to (q in (0,1])
     private static long percentile(List<Long> sorted, double q) {
         int rank = (int) Math.ceil(q * sorted.size());
         return sorted.get(Math.max(rank, 1) - 1);

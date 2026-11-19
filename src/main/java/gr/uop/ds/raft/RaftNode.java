@@ -838,10 +838,17 @@ public class RaftNode {
             return resp;
         } catch (StatusRuntimeException e) {
             print(ERROR, "ClientCommand to " + leader + " failed: " + e.getStatus().getCode());
-            return CommandResponse.newBuilder()
-                                  .setResult("unknown outcome: the command may or may not have been applied")
-                                  .setLeaderId(leader)
-                                  .build();
+            if (e.getStatus().getCode() == Status.Code.UNAVAILABLE) {
+                // we could not reach the leader
+                return CommandResponse.newBuilder()
+                        .setResult("leader " + leader + " unreachable, try again")
+                        .setLeaderId(leader)
+                        .build();
+            }
+            return CommandResponse.newBuilder() // deadline
+                    .setResult("unknown outcome: the command may or may not have been applied")
+                    .setLeaderId(leader)
+                    .build();
         }
     }
 
