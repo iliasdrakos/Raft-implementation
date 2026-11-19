@@ -131,6 +131,8 @@ public class RaftNode {
         print(STATE, "started as FOLLOWER, peers=" + peers.keySet());
     }
 
+    public String getNodeId() {return this.nodeId;}
+
     /**
      * Starts the two background tasks: the election timer (on every node) and the
      * heartbeat task every 500 ms (it does nothing unless this node is the leader).
@@ -401,6 +403,7 @@ public class RaftNode {
             
         }
         
+        sendHeartbeatsIfLeader();   // replicate now instead of waiting up to 500 ms for the next tick
         
         try {
             String result = future.get(1500, TimeUnit.MILLISECONDS);
@@ -578,7 +581,8 @@ public class RaftNode {
 
     // Heartbeats (only the leader)
     /**
-     * this method it is called every 500ms to sent data to the followers or tells them that is still the leader
+     * this method it is called every 500ms to sent data to the followers or tells them that is still the leader and it is called
+     * on the submit method for every new command that the client sents
      */
     private void sendHeartbeatsIfLeader() {
         for (var peer : peers.entrySet()) {
@@ -620,7 +624,7 @@ public class RaftNode {
     /**
      * Handles a follower's reply to an AppendEntries we sent.
      * On success, records how far the follower's log matches ours and tries to advance the commit index.
-     * On failure, moves nextIndex one step back so the next round probes an earlier position.
+     * On failure, moves nextIndex one step back and never below matchIndex + 1 so the next round probes an earlier position.
      * @param peer id of the follower that replied
      * @param req  the request WE sent (tells us exactly which entries the follower confirmed)
      * @param resp the follower's reply
@@ -635,8 +639,11 @@ public class RaftNode {
             // its a response from an old term or we are not the leader
             if (out.isVerbose()) print(REPL, "ignored a stale answer from " + peer + " (our request was for term " + req.getTerm() + ")");
         } else if(resp.getSuccess()) { // if he got it save it and prepare for commit
-            matchIndex.put(peer, req.getPrevLogIndex() + req.getEntriesCount());
-            nextIndex.put(peer,matchIndex.get(peer) + 1);
+           long confirmed = req.getPrevLogIndex() + req.getEntriesCount();
+            if (confirmed > matchIndex.get(peer)) {   // an older answer may arrive after a newer one and the matchIndex never moves back
+                matchIndex.put(peer, confirmed);
+            }
+            nextIndex.put(peer, matchIndex.get(peer) + 1);
             if (req.getEntriesCount() > 0) {
                 print(REPL, peer + " has our log up to " + matchIndex.get(peer)
                         + " (matchIndex=" + matchIndex.get(peer) + ", nextIndex=" + nextIndex.get(peer) + ")");
@@ -644,10 +651,14 @@ public class RaftNode {
             advanceCommitIndex();
 
         } else {
-             long oldNext = nextIndex.get(peer);
-             nextIndex.put(peer,Math.max(1, nextIndex.get(peer) - 1)); // walk back, retry next round
-             print(REPL, peer + " rejected prev=" + req.getPrevLogIndex() + "/t" + req.getPrevLogTerm()
-                     + ": nextIndex " + oldNext + " -> " + nextIndex.get(peer) + ", we retry from further back");
+            long oldNext = nextIndex.get(peer);
+            // step back to the prevLogIndex of this request, but never below what the follower already confirmed
+            nextIndex.put(peer, Math.max(matchIndex.get(peer) + 1, Math.min(oldNext, req.getPrevLogIndex())));
+            if (nextIndex.get(peer) != oldNext) {
+                print(REPL, peer + " rejected prev=" + req.getPrevLogIndex() + "/t" + req.getPrevLogTerm()
+                    + ": nextIndex " + oldNext + " -> " + nextIndex.get(peer) + ", we retry from further back");
+            }
+            
         }
     }
 
