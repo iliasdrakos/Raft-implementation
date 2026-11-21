@@ -6,6 +6,7 @@ import io.grpc.CallOptions;
 import io.grpc.Channel;
 import io.grpc.ClientCall;
 import io.grpc.ClientInterceptor;
+import io.grpc.ForwardingClientCall;
 import io.grpc.Metadata;
 import io.grpc.MethodDescriptor;
 import io.grpc.ServerCall;
@@ -24,6 +25,7 @@ public class FaultInjector implements ClientInterceptor, ServerInterceptor {
 
     private volatile int dropPercent = 0;   // 100 = the node is isolated
     private volatile long delayMs = 0;
+    private volatile boolean dropReplies = false; // our requests arrive, but every answer to us is lost
 
     public void isolate() {
         dropPercent = 100;
@@ -38,15 +40,23 @@ public class FaultInjector implements ClientInterceptor, ServerInterceptor {
         delayMs = Math.max(0, ms);
     }
 
+    public void dropReplies() {
+        off();
+        dropReplies = true;
+    }
+
     public void off() {
         dropPercent = 0;
         delayMs = 0;
+        dropReplies = false;
     }
 
     public String describe() {
+        if (dropReplies) return "NO REPLIES: our RPCs reach the other nodes, but every answer to us is lost";
         if (dropPercent == 0 && delayMs == 0) return "no faults";
         if (dropPercent == 100) return "ISOLATED: every RPC to or from this node is dropped";
-        return "dropping " + dropPercent + "% of RPCs, delaying each RPC by " + delayMs + " ms";
+    
+        return "dropping " + dropPercent + "% of RPCs, delaying each RPC that reaches this node by " + delayMs + " ms";
     }
 
     private boolean shouldDrop() {
@@ -69,10 +79,26 @@ public class FaultInjector implements ClientInterceptor, ServerInterceptor {
     @Override
     public <ReqT, RespT> ClientCall<ReqT, RespT> interceptCall(
             MethodDescriptor<ReqT, RespT> method, CallOptions callOptions, Channel next) {
+        if (dropReplies) {
+            return new ForwardingClientCall.SimpleForwardingClientCall<ReqT, RespT>(next.newCall(method, callOptions)) {
+                @Override
+                public void start(ClientCall.Listener<RespT> responseListener, Metadata headers) {
+                    // the request is really sent; we throw away whatever comes back
+                    super.start(new ClientCall.Listener<RespT>() {
+                        @Override
+                        public void onClose(Status status, Metadata trailers) {
+                            // DEADLINE_EXCEEDED, not UNAVAILABLE: the request DID arrive, so the outcome is unknown
+                            responseListener.onClose(
+                                    Status.DEADLINE_EXCEEDED.withDescription("reply dropped by fault injection"),
+                                    new Metadata());
+                        }
+                    }, headers);
+                }
+            };
+        }
         if (shouldDrop()) {
             return new DroppedCall<>();
         }
-        sleepDelay();
         return next.newCall(method, callOptions);
     }
 

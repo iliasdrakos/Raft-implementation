@@ -77,6 +77,7 @@ public class RaftNode {
     private final Map<String, Long> nextIndex = new HashMap<>();   // next entry to send to each peer
     private final Map<String, Long> matchIndex = new HashMap<>();  // highest entry known to be on each peer
     private final Map<Long, CompletableFuture<String>> pending = new HashMap<>(); // index -> waiting client
+    private final Map<String, Long> lastAckAt = new HashMap<>(); // when each peer last answered us
 
     // Infrastructure: not part of the Raft algorithm, just what we need to run it
     private final String nodeId;
@@ -90,15 +91,22 @@ public class RaftNode {
     private final NodeLogger out;
     private final Stats stats = new Stats();   // counters for the experiments (STATS command)
     private volatile boolean preVoteEnabled = Boolean.parseBoolean(System.getProperty("raft.prevote", "true"));   // PREVOTE on|off, or -Draft.prevote=false
+    private final boolean checkQuorumEnabled = Boolean.parseBoolean(System.getProperty("raft.checkQuorum", "true")); // -Draft.checkQuorum=false
     private final Map<String, Boolean> peerUp = new HashMap<>(); // last known reachability, so we print only changes
     private long electionTimeoutMs;
     private long lastHeartbeatAt = System.currentTimeMillis();
     private final Map<String, RaftServiceGrpc.RaftServiceStub> asyncPeers = new LinkedHashMap<>(); // non-blocking stubs: the answer arrives later in a callback
     private final Set<String> votesGranted = new HashSet<>(); // who voted for us in the current election (only while CANDIDATE)
+    private final Set<String> inFlight = new HashSet<>();   // followers with an AppendEntries on the way (at most one each)
     private int votesAnswered;                                 // how many peers answered or failed in the current election
     private long preVoteTerm = 0;                                 // the term our running pre-vote asks for (0 = no pre-vote running)
     private final Set<String> preVotesGranted = new HashSet<>(); // who said "yes" in the running pre-vote
     private int preVotesAnswered;                                 // how many peers answered or failed in the running pre-vote
+
+    // Timing in ms, configurable for the experiments: -Draft.heartbeat=100 -Draft.electionMin=1500 -Draft.electionMax=3000
+    private static final long HEARTBEAT_MS    = Long.getLong("raft.heartbeat", 500);
+    private static final long ELECTION_MIN_MS = Long.getLong("raft.electionMin", 1500);
+    private static final long ELECTION_MAX_MS = Long.getLong("raft.electionMax", 3000);
 
     /**
      * Creates the node as a FOLLOWER and restores currentTerm and votedFor from disk,
@@ -129,24 +137,26 @@ public class RaftNode {
         print(DISK, "loaded state.txt: term=" + currentTerm + ", votedFor=" + (votedFor == null ? "none" : votedFor));
         print(DISK, "loaded log.bin: " + log.lastIndex() + " entries (last " + log.lastIndex() + "/t" + log.lastTerm() + ")");
         print(STATE, "started as FOLLOWER, peers=" + peers.keySet());
+        print(STATE, "timing: heartbeat=" + HEARTBEAT_MS + " ms, election timeout=" + ELECTION_MIN_MS + "-" + ELECTION_MAX_MS
+        + " ms, pre-vote=" + (preVoteEnabled ? "on" : "off") + ", check-quorum=" + (checkQuorumEnabled ? "on" : "off"));
     }
 
     public String getNodeId() {return this.nodeId;}
 
     /**
      * Starts the two background tasks: the election timer (on every node) and the
-     * heartbeat task every 500 ms (it does nothing unless this node is the leader).
+     * heartbeat task every HEARTBEAT_MS (it does nothing unless this node is the leader).
      * Called after the gRPC server is up, so we can already answer our peers.
      */
     public void start() {
         resetElectionTimer();
-        scheduler.scheduleAtFixedRate(this::sendHeartbeatsIfLeader, 0, 500, TimeUnit.MILLISECONDS);
+        scheduler.scheduleAtFixedRate(this::sendHeartbeatsIfLeader, 0, HEARTBEAT_MS, TimeUnit.MILLISECONDS);
     }
 
     // Election Timer is random because we don't want all of them to become a candidate and vote them self because we are going to be in a infinite election
     private synchronized void resetElectionTimer() {
         if (electionTimer != null) electionTimer.cancel(false);
-        long timeout = 1500 + ThreadLocalRandom.current().nextLong(1500);  //1.5–3 s while testing
+        long timeout = ELECTION_MIN_MS + ThreadLocalRandom.current().nextLong(ELECTION_MAX_MS - ELECTION_MIN_MS);  // We can change the ms in the exec command
         electionTimeoutMs = timeout;
         electionTimer = scheduler.schedule(this::onElectionTimeout, timeout, TimeUnit.MILLISECONDS);
     }
@@ -284,7 +294,7 @@ public class RaftNode {
     public synchronized VoteResponse onPreVote(VoteRequest req) {
         long now = System.currentTimeMillis();
         boolean heardFromLeaderRecently =
-                role == Role.LEADER || (currentLeader != null && now - lastHeartbeatAt < 1500);
+                role == Role.LEADER || (currentLeader != null && now - lastHeartbeatAt < ELECTION_MIN_MS);
         boolean grant = req.getTerm() >= currentTerm
         && log.isUpToDate(req.getLastLogTerm(), req.getLastLogIndex())
         && !heardFromLeaderRecently;
@@ -338,10 +348,16 @@ public class RaftNode {
             boolean ok = log.tryAppend(req.getPrevLogIndex(), req.getPrevLogTerm(), req.getEntriesList());
             if (!ok) show = true;
             if (show) print(RECV, "<- " + leader + " " + NodeLogger.fmt(req));
+            long conflictIndex = 0;
             if (!ok && ourPrevTerm == -1) {
-                print(REPL, "REJECT: we don't have entry " + req.getPrevLogIndex() + " yet (our log ends at " + log.lastIndex() + ")");
+                conflictIndex = log.lastIndex() + 1;
+                print(REPL, "REJECT: we don't have entry " + req.getPrevLogIndex() + " yet (our log ends at " + log.lastIndex() + ")" + ", hint: try " + conflictIndex);
             } else if (!ok) {
-                print(REPL, "REJECT: term mismatch at " + req.getPrevLogIndex() + " (ours t" + ourPrevTerm + ", leader's t" + req.getPrevLogTerm() + ")");
+                conflictIndex = req.getPrevLogIndex();
+                while (conflictIndex > 1 && log.termAt(conflictIndex - 1) == ourPrevTerm) {
+                    conflictIndex--;
+                }
+                print(REPL, "REJECT: term mismatch at " + req.getPrevLogIndex() + " (ours t" + ourPrevTerm + ", leader's t" + req.getPrevLogTerm() + ")" + ", hint: try " + conflictIndex);
             } else if (req.getEntriesCount() > 0) {
                 if (conflictAt > 0) {
                     print(REPL, "CONFLICT at " + conflictAt + ": deleted our entries from " + conflictAt + " on and took the leader's");
@@ -360,6 +376,7 @@ public class RaftNode {
             rsp = AppendResponse.newBuilder()
                     .setTerm(currentTerm)
                     .setSuccess(ok)
+                    .setConflictIndex(conflictIndex)
                     .build();
             if (show) print(SEND, "-> " + leader + " " + NodeLogger.fmt(rsp));
         }
@@ -473,6 +490,36 @@ public class RaftNode {
         }
     }
 
+    /**
+     * CheckQuorum: a leader that has not heard from a majority for a whole
+     * election timeout steps down, so the others can elect a leader that a majority can reach.
+     * @return true if we are still the leader and may send heartbeats
+     */
+    private synchronized boolean checkQuorum() {
+        if (role != Role.LEADER) return false;
+        if (!checkQuorumEnabled) return true;
+        long now = System.currentTimeMillis();
+        int heard = 1; // ourselves
+        for (String peer : peers.keySet()) {
+            if (now - lastAckAt.getOrDefault(peer, 0L) < ELECTION_MIN_MS) heard++;
+        }
+        int majority = (peers.size() + 1) / 2 + 1;
+        if (heard >= majority) return true;
+
+        print(STATE, "LEADER -> FOLLOWER: CheckQuorum failed, only " + heard + "/" + (peers.size() + 1)
+                + " nodes answered in the last " + ELECTION_MIN_MS + " ms");
+        role = Role.FOLLOWER;   // same term: we did not see a newer one, we just cannot reach a majority
+        currentLeader = null;
+        stats.steppedDown();
+        stats.leaderLost(now);
+        for (CompletableFuture<String> f : pending.values()) {
+            f.completeExceptionally(new IllegalStateException("lost leadership"));
+        }
+        pending.clear();
+        resetElectionTimer();
+        return false;
+    }
+
     /** A peer answered our PreVote. Runs on a gRPC thread, so it takes the lock. */
     private synchronized void onPreVoteResponse(String peer, long proposedTerm, VoteResponse resp) {
         markPeer(peer, true, null);
@@ -530,7 +577,7 @@ public class RaftNode {
         VoteRequest req;
         synchronized (this) {
             if (role == Role.LEADER) { resetElectionTimer(); return; } // I am already the leader
-            if (preVoteEnabled && currentLeader != null && System.currentTimeMillis() - lastHeartbeatAt < 1500) return;  // while we were asking for pre-votes, a leader may have contacted us: then no election
+            if (preVoteEnabled && currentLeader != null && System.currentTimeMillis() - lastHeartbeatAt < ELECTION_MIN_MS) return;  // while we were asking for pre-votes, a leader may have contacted us: then no election
             long silence = System.currentTimeMillis() - lastHeartbeatAt;
             if (!preVoteEnabled) {
                 print(ELECT, "election timeout (" + electionTimeoutMs + " ms): no heartbeat from "
@@ -581,50 +628,19 @@ public class RaftNode {
 
     // Heartbeats (only the leader)
     /**
-     * this method it is called every 500ms to sent data to the followers or tells them that is still the leader and it is called
-     * on the submit method for every new command that the client sents
+     * this method it is called every HEARTBEAT_MS to sent data to the followers or tells them that is still the leader and it is called
+     * on the submit method for every new command that the client sends
      */
     private void sendHeartbeatsIfLeader() {
-        for (var peer : peers.entrySet()) {
-            String id = peer.getKey();
-            AppendRequest req;
-            boolean show;
-            synchronized (this) {                       // build the request under the lock
-                if (role != Role.LEADER) return; // only the leader replicates
-                // we send the entries from nextIndex on; prevIndex/prevTerm describe the entry just before them,
-                // the follower uses them for the consistency check
-                long next = nextIndex.get(id);
-                long prevIndex = next - 1;
-                long prevTerm = log.termAt(prevIndex);
-                req = AppendRequest.newBuilder() // constructing the request
-                            .setTerm(currentTerm)
-                            .setLeaderId(nodeId)
-                            .setPrevLogIndex(prevIndex)
-                            .setPrevLogTerm(prevTerm)
-                            .addAllEntries(log.entriesFrom(next))
-                            .setLeaderCommit(commitIndex)
-                            .build(); // building the request
-                show = out.isVerbose() || (req.getEntriesCount() > 0 && !Boolean.FALSE.equals(peerUp.get(id)));
-            } try {
-                // send outside the lock because a network call can take long and would freeze the whole node
-                if (show) {
-                    print(SEND, "-> " + id + " " + NodeLogger.fmt(req));
-                }
-                AppendResponse resp = peer.getValue().withDeadlineAfter(300, TimeUnit.MILLISECONDS).appendEntries(req);
-                markPeer(id, true, null);
-                onAppendResponse(id, req, resp);
-            } catch (StatusRuntimeException e) {
-                // the follower is down or slow: we simply retry on the next heartbeat (500 ms)
-                markPeer(id, false, e.getStatus().getCode().toString());
-                channels.get(id).resetConnectBackoff();
-            }
-        }
+        if (!checkQuorum()) return;
+        for (String peer : peers.keySet()) replicateTo(peer); // never waits, at most one request in flight per follower
     }
 
     /**
      * Handles a follower's reply to an AppendEntries we sent.
      * On success, records how far the follower's log matches ours and tries to advance the commit index.
-     * On failure, moves nextIndex one step back and never below matchIndex + 1 so the next round probes an earlier position.
+     * On failure, moves nextIndex back to the follower's hint (or one step back if there is none) 
+     * and never below matchIndex + 1 so the next round probes an earlier position.
      * @param peer id of the follower that replied
      * @param req  the request WE sent (tells us exactly which entries the follower confirmed)
      * @param resp the follower's reply
@@ -653,12 +669,16 @@ public class RaftNode {
         } else {
             long oldNext = nextIndex.get(peer);
             // step back to the prevLogIndex of this request, but never below what the follower already confirmed
-            nextIndex.put(peer, Math.max(matchIndex.get(peer) + 1, Math.min(oldNext, req.getPrevLogIndex())));
+            long target = Math.min(oldNext, req.getPrevLogIndex());
+            long hint = resp.getConflictIndex();
+            if (hint > 0) {
+                target = Math.min(target, hint); // the follower told us where to try
+            }
+            nextIndex.put(peer, Math.max(matchIndex.get(peer) + 1, target));
             if (nextIndex.get(peer) != oldNext) {
                 print(REPL, peer + " rejected prev=" + req.getPrevLogIndex() + "/t" + req.getPrevLogTerm()
-                    + ": nextIndex " + oldNext + " -> " + nextIndex.get(peer) + ", we retry from further back");
+                    + ": nextIndex " + oldNext + " -> " + nextIndex.get(peer) + " (follower's hint " + hint + ")");
             }
-            
         }
     }
 
@@ -692,7 +712,8 @@ public class RaftNode {
      */
     // must be called while holding the lock
     private void becomeLeader() {
-        scheduler.execute(this::sendHeartbeatsIfLeader);   // tell the followers now, not at the next 500 ms tick
+        inFlight.clear();
+        scheduler.execute(this::sendHeartbeatsIfLeader);   // tell the followers now, not at the next HEARTBEAT_MS tick
         stats.electionWon();
         stats.leaderFound();
         Role oldRole = role;
@@ -700,7 +721,8 @@ public class RaftNode {
         currentLeader = nodeId;
         for (String peer : peers.keySet()) {
             nextIndex.put(peer, log.lastIndex() + 1); // assume they have everything we have
-            matchIndex.put(peer, 0L); //we have confirmed nothing yet
+            matchIndex.put(peer, 0L); // we have confirmed nothing yet
+            lastAckAt.put(peer, System.currentTimeMillis()); // a new leader gets one full election timeout of grace
         }
         print(STATE, oldRole + " -> LEADER of term " + currentTerm + ", nextIndex=" + (log.lastIndex() + 1) + " for every peer");
         // An entry of our own term lets us commit older entries
@@ -850,6 +872,56 @@ public class RaftNode {
                     .setLeaderId(leader)
                     .build();
         }
+    }
+
+    /** Sends the next AppendEntries to one follower, unless one is already on the way. Never waits. */
+    private void replicateTo(String peer) {
+        AppendRequest req;
+        boolean show;
+        synchronized (this) {
+            if (role != Role.LEADER || inFlight.contains(peer)) return;   // one request at a time per follower
+            long next = nextIndex.get(peer);
+            long prevIndex = next - 1;
+            req = AppendRequest.newBuilder()
+                    .setTerm(currentTerm)
+                    .setLeaderId(nodeId)
+                    .setPrevLogIndex(prevIndex)
+                    .setPrevLogTerm(log.termAt(prevIndex))
+                    .addAllEntries(log.entriesFrom(next))
+                    .setLeaderCommit(commitIndex)
+                    .build();
+            show = out.isVerbose() || (req.getEntriesCount() > 0 && !Boolean.FALSE.equals(peerUp.get(peer)));
+            inFlight.add(peer);
+        }
+        if (show) print(SEND, "-> " + peer + " " + NodeLogger.fmt(req));
+        asyncPeers.get(peer).withDeadlineAfter(300, TimeUnit.MILLISECONDS)
+                .appendEntries(req, new StreamObserver<AppendResponse>() {
+                    @Override public void onNext(AppendResponse resp) {
+                        ackFrom(peer);
+                        markPeer(peer, true, null);
+                        onAppendResponse(peer, req, resp);
+                    }
+                    @Override public void onError(Throwable t) {
+                        markPeer(peer, false, Status.fromThrowable(t).getCode().toString());
+                        channels.get(peer).resetConnectBackoff();
+                        release(peer);                                 // if it failed wait for the next tick, no hot loop
+                    }
+                    @Override public void onCompleted() {
+                        if (release(peer)) replicateTo(peer);          // did it answered if it still misses entries, send at once
+                    }
+                });
+    }
+
+    // must not be called while holding the lock from outside
+    // frees the follower; returns true if we are still the leader and the follower still misses entries
+    private synchronized boolean release(String peer) {
+        inFlight.remove(peer); 
+        return role == Role.LEADER && nextIndex.get(peer) <= log.lastIndex();
+    }
+
+    // any answer from a peer in our term proves that the peer still hears us
+    private synchronized void ackFrom(String peer) {
+        lastAckAt.put(peer, System.currentTimeMillis());
     }
 
     public synchronized String statsReport() {

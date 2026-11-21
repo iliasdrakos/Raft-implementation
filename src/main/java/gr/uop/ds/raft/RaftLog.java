@@ -2,10 +2,13 @@ package gr.uop.ds.raft;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
-
+import java.util.Set;
+import java.util.concurrent.TimeUnit;
 import gr.uop.ds.raft.proto.LogEntry;
+import io.grpc.stub.StreamObserver;
 
 
 /**

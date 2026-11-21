@@ -49,6 +49,7 @@ message AppendRequest {
 message AppendResponse {
   int64 term    = 1;
   bool  success = 2;
+  int64 conflictIndex = 3; // the index the leader should try next. 0 = no hint.
 }
 
 service RaftService {

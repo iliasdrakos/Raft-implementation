@@ -132,10 +132,11 @@ public class Raft {
                     case "off" -> faults.off();
                     case "drop" -> faults.drop(Integer.parseInt(f[1]));
                     case "delay" -> faults.delay(Long.parseLong(f[1]));
-                    default -> System.out.println("usage: FAULT [isolate [seconds] | drop <percent> | delay <ms> | off]");
+                    case "noreply" -> faults.dropReplies();   // FAULT noreply
+                    default -> System.out.println("usage: FAULT [isolate [seconds] | drop <percent> | delay <ms> | noreply | off]");
                 }
             } catch (NumberFormatException | ArrayIndexOutOfBoundsException e) {
-                System.out.println("usage: FAULT [isolate [seconds] | drop <percent> | delay <ms> | off]");
+                System.out.println("usage: FAULT [isolate [seconds] | drop <percent> | delay <ms> | noreply | off]");
             }
         }
         System.out.println("[" + nodeId + "] faults: " + faults.describe());
