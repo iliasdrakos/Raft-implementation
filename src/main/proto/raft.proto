@@ -10,6 +10,8 @@ message LogEntry {
   int64  term    = 1;   // what term was created by the leader
   int64  index   = 2;   //index of term
   string command = 3;   //command that we put
+  string client_id = 4;   // client session, empty = no session
+  int64  seq       = 5;   // the client's number for this command; a retry keeps the same seq
 }
 
 //candidate -> for all the others
@@ -27,6 +29,8 @@ message VoteResponse {
 
 message CommandRequest {
   string command = 1; // the command that we need to give to the leader
+  string client_id = 2; // client session, empty = no session
+  int64  seq       = 3; // the client's number for this command
 }
 
 message CommandResponse {

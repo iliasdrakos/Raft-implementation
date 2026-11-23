@@ -46,7 +46,7 @@ public class RaftServiceImpl extends RaftServiceGrpc.RaftServiceImplBase {
      */
     @Override
     public void clientCommand(CommandRequest req, StreamObserver<CommandResponse> out) {
-        out.onNext(node.submit(req.getCommand()));
+        out.onNext(node.submit(req.getCommand(), req.getClientId(), req.getSeq()));
         out.onCompleted();
     }
 

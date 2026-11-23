@@ -92,6 +92,9 @@ public class RaftNode {
     private final Stats stats = new Stats();   // counters for the experiments (STATS command)
     private volatile boolean preVoteEnabled = Boolean.parseBoolean(System.getProperty("raft.prevote", "true"));   // PREVOTE on|off, or -Draft.prevote=false
     private final boolean checkQuorumEnabled = Boolean.parseBoolean(System.getProperty("raft.checkQuorum", "true")); // -Draft.checkQuorum=false
+    private final boolean readIndexEnabled = Boolean.parseBoolean(System.getProperty("raft.readIndex", "true")); // -Draft.ReadIndex=false
+    private final Map<String, Long> lastAckSentAt = new HashMap<>(); // per peer: when the newest request it answered was SENT (nanoTime)
+    private long readRequestedAt = 0; // nanoTime of the newest read that waits for a heartbeat round
     private final Map<String, Boolean> peerUp = new HashMap<>(); // last known reachability, so we print only changes
     private long electionTimeoutMs;
     private long lastHeartbeatAt = System.currentTimeMillis();
@@ -138,7 +141,8 @@ public class RaftNode {
         print(DISK, "loaded log.bin: " + log.lastIndex() + " entries (last " + log.lastIndex() + "/t" + log.lastTerm() + ")");
         print(STATE, "started as FOLLOWER, peers=" + peers.keySet());
         print(STATE, "timing: heartbeat=" + HEARTBEAT_MS + " ms, election timeout=" + ELECTION_MIN_MS + "-" + ELECTION_MAX_MS
-        + " ms, pre-vote=" + (preVoteEnabled ? "on" : "off") + ", check-quorum=" + (checkQuorumEnabled ? "on" : "off"));
+        + " ms, pre-vote=" + (preVoteEnabled ? "on" : "off") + ", check-quorum=" + (checkQuorumEnabled ? "on" : "off") 
+        + ", read-index=" + (readIndexEnabled ? "on" : "off"));
     }
 
     public String getNodeId() {return this.nodeId;}
@@ -392,13 +396,24 @@ public class RaftNode {
         return 0;
     }
 
+
+    /**  
+     * overloaded method so we can enter the command without a client id 
+     * @param command the command to execute
+     * @return the response to the command
+     */
+    public CommandResponse submit(String command) {return submit(command, "", 0);}
+
     /**
      * Leader side of a client command: appends it to the log and waits
      * until it is committed and applied, so the client gets the real result.
      * A follower answers "not the leader".
      * @param command the client's command, e.g. "PUT x 5"
+     * @param clientId the client's ID
+     * @param seq the sequence number
      */
-    public CommandResponse submit(String command) {
+    public CommandResponse submit(String command, String clientId, long seq) {
+        if (readIndexEnabled && isRead(command)) return readIndexGet(command.trim().split("\\s+")[1]); // no log entry for reads
         long index;
         CompletableFuture<String> future = new CompletableFuture<>();
         synchronized (this) {
@@ -412,7 +427,8 @@ public class RaftNode {
                                     .build();
             }
             index = log.lastIndex() + 1;
-            log.append(LogEntry.newBuilder().setIndex(index).setTerm(currentTerm).setCommand(command).build());
+            log.append(LogEntry.newBuilder().setIndex(index).setTerm(currentTerm).setCommand(command)
+                .setClientId(clientId).setSeq(seq).build());
             pending.put(index, future);
             stats.appended(index);
             print(CLIENT, "\"" + command + "\" appended at index " + index + " (term " + currentTerm
@@ -518,6 +534,66 @@ public class RaftNode {
         pending.clear();
         resetElectionTimer();
         return false;
+    }
+
+    /**
+     * Linearizable read without a log entry (ReadIndex).
+     * 0. we must have committed an entry of our own term (our NOOP), otherwise commitIndex may be too old
+     * 1. readIndex = commitIndex
+     * 2. a majority must answer a heartbeat that was SENT after this read started: so we were still the leader
+     * 3. wait until lastApplied >= readIndex
+     * 4. read our own KvStore
+     * A read changes nothing, so every failure here is safe to retry.
+     * @param key the key to read
+     * @return the response containing the value or an error message
+     */
+    public CommandResponse readIndexGet(String key) {
+        long readIndex;
+        long t = System.nanoTime();
+        synchronized (this) {
+            if (role != Role.LEADER) return readFailed("not the leader");
+            if (log.termAt(commitIndex) != currentTerm) return readFailed("no entry of term " + currentTerm + " committed yet, try again");
+            readIndex = commitIndex;
+            readRequestedAt = Math.max(readRequestedAt, t);
+        }
+        sendHeartbeatsIfLeader(); // start the round now, do not wait for the next tick
+        long deadline = System.currentTimeMillis() + 1500;
+        synchronized (this) {
+            while (true) {
+                if (role != Role.LEADER) return readFailed("lost leadership, try again");
+                int heard = 1; // ourselves
+                for (String peer : peers.keySet()) {
+                    if (lastAckSentAt.getOrDefault(peer, 0L) >= t) heard++;
+                }
+                if (heard >= (peers.size() + 1) / 2 + 1 && lastApplied >= readIndex) break;
+                long left = deadline - System.currentTimeMillis();
+                if (left <= 0) return readFailed("timeout: could not confirm that we are still the leader, try again");
+                try {
+                    wait(left); // releases the lock until ackFrom or applyCommitted wakes us up
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return readFailed("interrupted");
+                }
+            }
+            String value = kv.get(key);
+            String shown = value == null ? "(not found)" : value;
+            print(CLIENT, "GET " + key + " via ReadIndex (readIndex=" + readIndex + ") -> " + shown);
+            return CommandResponse.newBuilder().setSuccess(true).setResult(shown)
+                    .setLeaderId(nodeId).setIndex(readIndex).build();
+        }
+    }
+
+    // must be called while holding the lock
+    private CommandResponse readFailed(String why) {
+        print(CLIENT, "GET rejected: " + why);
+        return CommandResponse.newBuilder().setSuccess(false).setResult(why)
+                .setLeaderId(currentLeader == null ? "" : currentLeader).build();
+    }
+
+    // "GET key" is a read; everything else is a command that goes into the log
+    private static boolean isRead(String command) {
+        String[] p = command.trim().split("\\s+");
+        return p.length == 2 && p[0].equalsIgnoreCase("GET");
     }
 
     /** A peer answered our PreVote. Runs on a gRPC thread, so it takes the lock. */
@@ -682,11 +758,6 @@ public class RaftNode {
         }
     }
 
-    // Reads from THIS node's copy of the store. On a follower the value may be slightly stale.
-    public synchronized String localGet(String key) {
-        return kv.get(key);
-    }
-
     /**
      * Applies to the KvStore, in log order, every entry after lastApplied up to commitIndex.
      * Every node applies the same commands in the same order, so all KvStores end up identical.
@@ -695,14 +766,17 @@ public class RaftNode {
     private void applyCommitted() {
         while(lastApplied < commitIndex) {
             lastApplied++;
-            String command = log.get(lastApplied).getCommand();
-            String result = kv.apply(command);
-            print(result.startsWith("ERR") ? ERROR : APPLY, "apply " + lastApplied + ": \"" + command + "\" -> " + result);
-            stats.applied(lastApplied);
+            LogEntry e = log.get(lastApplied);
+            boolean dup = kv.isDuplicate(e.getClientId(), e.getSeq());
+            String result = kv.apply(e.getClientId(), e.getSeq(), e.getCommand());
+            String session = e.getClientId().isEmpty() ? "" : " [" + e.getClientId() + " #" + e.getSeq() + "]";
+            print(result.startsWith("ERR") ? ERROR : APPLY, "apply " + lastApplied + ": \"" + e.getCommand() + "\"" + session
+                    + (dup ? " DUPLICATE, not applied again" : "") + " -> " + result);
             CompletableFuture<String> waiting = pending.remove(lastApplied);
             if (waiting != null) {
                 waiting.complete(result);   // wake up the client that waits for this index
             }
+            notifyAll(); // a waiting read may continue
         }
     }
 
@@ -831,17 +905,24 @@ public class RaftNode {
     }
 
     /**
+     * Overloaded method so we can enter the command without a client id.
+     * @param command the command to execute
+     * @return the response to the command
+     */
+    public CommandResponse execute(String command) {return execute(command, "", 0);}
+
+    /**
      * Used by the terminal: if we are the leader we run the command here,
      * otherwise we forward it to the leader with the ClientCommand RPC.
      */
-    public CommandResponse execute(String command) {
+    public CommandResponse execute(String command, String clientId, long seq) {
         String leader;
         boolean amLeader;
         synchronized (this) {
             amLeader = (role == Role.LEADER);
             leader = currentLeader;
         }
-        if (amLeader) return submit(command);  // submit waits
+        if (amLeader) return submit(command, clientId, seq);  // submit waits
 
         if (leader == null) {
             print(CLIENT,"\"" + command + "\" rejected: no leader known yet, try again");
@@ -853,7 +934,8 @@ public class RaftNode {
 
         // here we do NOT hold the lock: the network call may take long
         try {
-            CommandRequest req = CommandRequest.newBuilder().setCommand(command).build();
+            CommandRequest req = CommandRequest.newBuilder().setCommand(command)
+                .setClientId(clientId).setSeq(seq).build();
             print(SEND, "-> " + leader + " " + NodeLogger.fmt(req));
             CommandResponse resp = peers.get(leader).withDeadlineAfter(2, TimeUnit.SECONDS).clientCommand(req);
             print(RECV, "<- " + leader + " " + NodeLogger.fmt(resp));
@@ -894,10 +976,11 @@ public class RaftNode {
             inFlight.add(peer);
         }
         if (show) print(SEND, "-> " + peer + " " + NodeLogger.fmt(req));
+        final long sentAt = System.nanoTime(); // the follower answers after this moment
         asyncPeers.get(peer).withDeadlineAfter(300, TimeUnit.MILLISECONDS)
                 .appendEntries(req, new StreamObserver<AppendResponse>() {
                     @Override public void onNext(AppendResponse resp) {
-                        ackFrom(peer);
+                        ackFrom(peer, sentAt, resp.getTerm());
                         markPeer(peer, true, null);
                         onAppendResponse(peer, req, resp);
                     }
@@ -915,13 +998,20 @@ public class RaftNode {
     // must not be called while holding the lock from outside
     // frees the follower; returns true if we are still the leader and the follower still misses entries
     private synchronized boolean release(String peer) {
-        inFlight.remove(peer); 
-        return role == Role.LEADER && nextIndex.get(peer) <= log.lastIndex();
+        inFlight.remove(peer);
+        if (role != Role.LEADER) return false;
+        boolean moreEntries = nextIndex.get(peer) <= log.lastIndex();
+        boolean readWaits = lastAckSentAt.getOrDefault(peer, 0L) < readRequestedAt; // a read needs a heartbeat sent after it started
+        return moreEntries || readWaits;
     }
 
     // any answer from a peer in our term proves that the peer still hears us
-    private synchronized void ackFrom(String peer) {
+    private synchronized void ackFrom(String peer, long sentAt, long respTerm) {
         lastAckAt.put(peer, System.currentTimeMillis());
+        if (respTerm == currentTerm && sentAt > lastAckSentAt.getOrDefault(peer, 0L)) {
+            lastAckSentAt.put(peer, sentAt);
+        }
+        notifyAll(); // wake up reads that wait for this heartbeat round
     }
 
     public synchronized String statsReport() {
@@ -930,5 +1020,10 @@ public class RaftNode {
 
     public synchronized void resetStats() {
         stats.reset(currentLeader != null);
+    }
+
+    // Reads from THIS node's copy of the store. On a follower the value may be slightly stale.
+    public synchronized String localGet(String key) {
+        return kv.get(key);
     }
 }

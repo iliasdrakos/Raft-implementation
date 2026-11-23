@@ -47,6 +47,9 @@ public class Raft {
         // Temporary "client" to type commands in the leader's terminal, e.g. PUT x 5
         BufferedReader in = new BufferedReader(new InputStreamReader(System.in));
         String line;
+        String cliClientId = nodeId + "-cli-" + System.currentTimeMillis(); // one session per CLI run
+        long cliSeq = 0;
+        String lastCmd = null; // the last PUT/DEL/INCR, for RETRY
         while ((line = in.readLine()) != null) {
             line = line.trim();
             if (line.isEmpty()) continue;
@@ -55,21 +58,37 @@ public class Raft {
             String arg = parts.length > 1 ? parts[1] : null;   // what comes after the command, or null
 
             switch (parts[0].toUpperCase()) {
+                case "LGET" -> {
+                    if (arg == null) {
+                        System.out.println("usage: GET key");
+                    } else {
+                        String value = node.localGet(arg); // local read: fast, but may be stale
+                        System.out.println("[" + nodeId + "] " + arg + " = " + (value == null ? "(not found)" : value));
+                    }
+                }
                 case "GET" -> {
                     if (arg == null) {
                         System.out.println("usage: GET key");
                     } else {
-                        String value = node.localGet(arg);
-                        System.out.println("[" + nodeId + "] " + arg + " = " + (value == null ? "(not found)" : value));
+                        cliSeq++;
+                        lastCmd = "GET " + arg;
+                        CommandResponse r = node.execute(lastCmd, cliClientId, cliSeq);   // now we have linearizable reads going through the log
+                        printResult(nodeId, lastCmd + " [#" + cliSeq + "]", r);
                     }
                 }
-                case "PUT", "DEL" -> {
-                    CommandResponse r = node.execute(line);   // PUT OR DEL go through Raft
-                    if (r.getSuccess()) {
-                        System.out.println("[" + nodeId + "] " + line + " -> " + r.getResult()
-                                + " (committed at index " + r.getIndex() + " by leader " + r.getLeaderId() + ")");
+                case "PUT", "DEL", "INCR" -> {
+                    cliSeq++;
+                    lastCmd = line;
+                    CommandResponse r = node.execute(line, cliClientId, cliSeq);   // PUT, DEL, INCR go through Raft
+                    printResult(nodeId, line + " [#" + cliSeq + "]", r);
+                }
+                case "RETRY" -> {
+                    if (lastCmd == null) {
+                        System.out.println("nothing to retry");
                     } else {
-                        System.out.println("[" + nodeId + "] " + line + " -> FAILED: " + r.getResult());
+                        // we have SAME clientId and SAME seq if it was already applied, we get the stored result
+                        CommandResponse r = node.execute(lastCmd, cliClientId, cliSeq);
+                        printResult(nodeId, "RETRY " + lastCmd + " [#" + cliSeq + "]", r);
                     }
                 }
                 case "STATUS" -> System.out.println(node.status());
@@ -101,14 +120,27 @@ public class Raft {
                 case "FAULT" -> handleFault(nodeId, faults, arg);
                 case "CRASH" -> Runtime.getRuntime().halt(1);
                 case "BENCH" -> {
-                try {
-                    int n = arg == null ? 100 : Integer.parseInt(arg.trim());
-                    if (n < 1) throw new NumberFormatException();
-                    runBench(node, n);
-                } catch (NumberFormatException e) {
-                    System.out.println("usage: BENCH [n]   (n >= 1, default 100)");
+                    try {
+                        int n = arg == null ? 100 : Integer.parseInt(arg.trim());
+                        if (n < 1) throw new NumberFormatException();
+                        runBench(node, n,false);
+                    } catch (NumberFormatException e) {
+                        System.out.println("usage: BENCH [n]   (n >= 1, default 100)");
+                    }
                 }
-}
+                case "BENCHGET" -> {
+                    int n = 100;
+                    try {
+                        if (arg != null) n = Integer.parseInt(arg.trim());
+                    } catch (NumberFormatException e) {
+                        n = -1;
+                    }
+                    if (n < 1) {
+                        System.out.println("usage: BENCHGET [iterations >= 1]");
+                    } else {
+                        runBench(node, n, true);
+                    }
+                }
                 case "HELP" -> printHelp();
                 default -> System.out.println("unknown command: " + parts[0] + " (type HELP)");
             }
@@ -143,27 +175,33 @@ public class Raft {
     }
 
     /** sends n PUTs one after the other and prints the latency the client sees. */
-    private static void runBench(RaftNode node, int n) {
+    private static void runBench(RaftNode node, int n, boolean reads) {
         List<Long> all = new ArrayList<>();   // latency of every request in ms, failures included
         int ok = 0, unknown = 0, rejected = 0 , retries = 0;
         long start = System.nanoTime();       // a clock that never jumps, made for measuring durations
+        String benchClientId = node.getNodeId() + "-bench-" + System.currentTimeMillis(); // one session per bench run
+        int resolved = 0; // commands that got "unknown" first and then a real answer after a retry
         for (int i = 0; i < n; i++) {
-            String cmd = "PUT bench" + i + " " + i;
+            String cmd = reads ? "GET bench" + i : "PUT bench" + i + " " + i;
             long t0 = System.nanoTime();
+            long seq = i + 1;            // a new number for every new command
+            boolean sawUnknown = false;
             CommandResponse r;
             while (true) {
-                r = node.execute(cmd);
+                r = node.execute(cmd, benchClientId, seq);   // a retry keeps the SAME seq: it can never apply twice
+                if (r.getSuccess()) break;
                 boolean unknownOutcome = r.getResult().startsWith("timeout") || r.getResult().startsWith("unknown outcome");
-                boolean surelyNotApplied = !r.getSuccess() && !unknownOutcome;   // "no leader known", "not the leader"
-                if (!surelyNotApplied || (System.nanoTime() - t0) / 1_000_000 > 5000) break;   // done, or give up after 5 s
+                if (unknownOutcome) sawUnknown = true;
+                if ((System.nanoTime() - t0) / 1_000_000 > 5000) break;   // give up on THIS command after 5 s
                 retries++;
                 try {
-                    Thread.sleep(50);   // the cluster may be electing a leader: wait a little and ask again
+                    Thread.sleep(50);
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                     break;
                 }
             }
+            if (r.getSuccess() && sawUnknown) resolved++;
             all.add((System.nanoTime() - t0) / 1_000_000);   // includes the waiting
             if (r.getSuccess()) {
                 ok++;
@@ -177,8 +215,8 @@ public class Raft {
         double seconds = (System.nanoTime() - start) / 1e9;
         Collections.sort(all);
         double avg = all.stream().mapToLong(Long::longValue).average().orElse(0);
-        System.out.printf("[%s] BENCH n=%d: ok=%d, unknown=%d, retries=%d, rejected=%d in %.1f s, throughput=%.1f PUT/s%n",
-                node.getNodeId(), n, ok, unknown, retries, rejected, seconds, ok / seconds);
+        System.out.printf("[%s] BENCH n=%d: ok=%d, unknown=%d, resolved=%d, retries=%d, rejected=%d in %.1f s, throughput=%.1f PUT/s%n",
+                node.getNodeId(), n, ok, unknown, resolved, retries, rejected, seconds, ok / seconds);
         System.out.printf("        latency (ms): avg=%.1f  p50=%d  p95=%d  p99=%d  max=%d%n",
                 avg, percentile(all, 0.50), percentile(all, 0.95), percentile(all, 0.99), all.get(all.size() - 1));
     }
@@ -189,7 +227,16 @@ public class Raft {
         return sorted.get(Math.max(rank, 1) - 1);
     }
 
+    private static void printResult(String nodeId, String what, CommandResponse r) {
+        if (r.getSuccess()) {
+            System.out.println("[" + nodeId + "] " + what + " -> " + r.getResult()
+                    + " (committed at index " + r.getIndex() + " by leader " + r.getLeaderId() + ")");
+        } else {
+            System.out.println("[" + nodeId + "] " + what + " -> FAILED: " + r.getResult());
+        }
+    }
+
     private static void printHelp() {
-        System.out.println("commands: PUT key value | DEL key | GET key | STATUS | LOG | VERBOSE on|off | HELP | FAULT [isolate|drop N|delay MS|off] | CRASH | STATS [reset] | BENCH [iterations]");
+        System.out.println("commands: PUT key value | DEL key | GET key| LGET key | INCR key | RETRY | STATUS | LOG | VERBOSE on|off | HELP | FAULT [isolate|drop N|delay MS|off] | CRASH | STATS [reset] | BENCH [iterations]");
     }
 }
