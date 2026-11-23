@@ -93,6 +93,7 @@ public class RaftNode {
     private volatile boolean preVoteEnabled = Boolean.parseBoolean(System.getProperty("raft.prevote", "true"));   // PREVOTE on|off, or -Draft.prevote=false
     private final boolean checkQuorumEnabled = Boolean.parseBoolean(System.getProperty("raft.checkQuorum", "true")); // -Draft.checkQuorum=false
     private final boolean readIndexEnabled = Boolean.parseBoolean(System.getProperty("raft.readIndex", "true")); // -Draft.ReadIndex=false
+    private final boolean unsafeReads = Boolean.parseBoolean(System.getProperty("raft.unsafeReads", "false")); //-Draft.unsafeReads=true answer GETs from the local state machine, on any node,without ReadIndex. This is deliberately unsafe (stale reads).
     private final Map<String, Long> lastAckSentAt = new HashMap<>(); // per peer: when the newest request it answered was SENT (nanoTime)
     private long readRequestedAt = 0; // nanoTime of the newest read that waits for a heartbeat round
     private final Map<String, Boolean> peerUp = new HashMap<>(); // last known reachability, so we print only changes
@@ -142,7 +143,7 @@ public class RaftNode {
         print(STATE, "started as FOLLOWER, peers=" + peers.keySet());
         print(STATE, "timing: heartbeat=" + HEARTBEAT_MS + " ms, election timeout=" + ELECTION_MIN_MS + "-" + ELECTION_MAX_MS
         + " ms, pre-vote=" + (preVoteEnabled ? "on" : "off") + ", check-quorum=" + (checkQuorumEnabled ? "on" : "off") 
-        + ", read-index=" + (readIndexEnabled ? "on" : "off"));
+        + ", read-index=" + (readIndexEnabled ? "on" : "off") +  ", unsafe-reads=" + unsafeReads);
     }
 
     public String getNodeId() {return this.nodeId;}
@@ -413,6 +414,15 @@ public class RaftNode {
      * @param seq the sequence number
      */
     public CommandResponse submit(String command, String clientId, long seq) {
+        if (unsafeReads && isRead(command)) { // NEGATIVE CONTROL ONLY: local read, no leader check, no ReadIndex.
+            String key = command.trim().split("\\s+")[1];
+            String v = localGet(key);
+            return CommandResponse.newBuilder()
+                    .setSuccess(true)
+                    .setResult(v == null ? "(not found)" : v)
+                    .setLeaderId(nodeId)
+                    .build();
+        }
         if (readIndexEnabled && isRead(command)) return readIndexGet(command.trim().split("\\s+")[1]); // no log entry for reads
         long index;
         CompletableFuture<String> future = new CompletableFuture<>();
