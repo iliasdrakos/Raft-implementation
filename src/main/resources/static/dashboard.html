@@ -1,0 +1,752 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Raft KV dashboard</title>
+<style>
+  :root {
+    --bg: #1e1e1e; --panel: #252526; --bar: #333333; --border: #3c3c3c; --text: #d4d4d4; --dim: #858585;
+    --leader: #e5c07b; --follower: #61afef; --candidate: #c678dd; --down: #f14c4c; --ok: #89d185; --isolated: #6b6b6b;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
+               font: 13px/1.4 "Segoe UI", system-ui, sans-serif; }
+  .mono { font-family: Consolas, "Cascadia Code", monospace; }
+
+  /* layout: like VS Code */
+  #app { display: grid; height: 100%;
+         grid-template-columns: 48px 230px 1fr 300px;
+         grid-template-rows: 28px 1fr var(--panel-h, 230px) 22px;
+         grid-template-areas: "title title title title" "act side main details" "act side panel panel" "status status status status"; }
+  #app.no-side { grid-template-columns: 48px 0 1fr 300px; }
+  #app.no-panel { grid-template-rows: 28px 1fr 0 22px; }
+  #title { grid-area: title; background: var(--bar); display: flex; align-items: center; padding: 0 12px; gap: 16px; }
+  #title b { color: #fff; }
+  #activity { grid-area: act; background: var(--bar); display: flex; flex-direction: column; align-items: center; padding-top: 6px; gap: 4px; }
+  #activity button { width: 40px; height: 40px; background: none; border: 0; color: var(--dim); font-size: 20px; cursor: pointer; border-left: 2px solid transparent; }
+  #activity button.on { color: #fff; border-left-color: #fff; }
+  #side { grid-area: side; background: var(--panel); border-right: 1px solid var(--border); overflow: auto; }
+  #main { grid-area: main; position: relative; overflow: hidden; }
+  #details { grid-area: details; background: var(--panel); border-left: 1px solid var(--border); overflow: auto; padding: 0 12px 12px; }
+  #panel { grid-area: panel; background: var(--panel); border-top: 1px solid var(--border); display: flex; flex-direction: column; min-height: 0; }
+  #status { grid-area: status; background: #007acc; color: #fff; display: flex; align-items: center; gap: 18px; padding: 0 10px; font-size: 12px; }
+  #status.trouble { background: #a1260d; }
+  h3 { font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--dim); margin: 12px 12px 6px; }
+
+  /* side bar: available nodes and presets */
+  .node-row { display: flex; align-items: center; gap: 8px; padding: 6px 12px; cursor: pointer; }
+  .node-row:hover { background: #2a2d2e; }
+  .node-row.sel { background: #37373d; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; flex: none; }
+  .node-row .role { margin-left: auto; font-size: 11px; color: var(--dim); }
+  .preset { display: block; width: calc(100% - 24px); margin: 4px 12px; padding: 6px 8px; text-align: left;
+            background: #3a3d41; color: var(--text); border: 1px solid var(--border); cursor: pointer; }
+  .preset:hover { background: #45494e; }
+  .hint { color: var(--dim); font-size: 12px; margin: 4px 12px; }
+
+  /* cluster diagram */
+  #cluster { width: 100%; height: 100%; }
+  .node-g { cursor: pointer; transition: transform .7s ease; }
+  .node-g circle { stroke-width: 3; }
+  .node-g text { text-anchor: middle; fill: var(--text); pointer-events: none; }
+  .edge { stroke: #4b4b4b; stroke-width: 2; }
+  .edge.silent { stroke: var(--down); stroke-dasharray: 6 5; }
+  .edge.oneway { stroke: #d19a66; stroke-dasharray: 2 5; }
+  .edge.election { stroke: var(--candidate); stroke-dasharray: 3 4; }
+  .msg { pointer-events: none; }
+  #menu { position: fixed; display: none; z-index: 10; background: #252526; border: 1px solid #454545;
+          box-shadow: 0 4px 14px rgba(0,0,0,.5); padding: 4px 0; min-width: 170px; }
+  #menu div { padding: 5px 14px; cursor: pointer; }
+  #menu div:hover { background: #04395e; }
+  #menu .sep { border-top: 1px solid #454545; margin: 4px 0; padding: 0; cursor: default; }
+  #menu .title { color: var(--dim); font-size: 11px; cursor: default; }
+  #menu .title:hover { background: none; }
+  .legend { position: absolute; left: 12px; bottom: 8px; color: var(--dim); font-size: 11px; }
+  .speed { position: absolute; right: 12px; top: 8px; color: var(--dim); font-size: 11px; display: flex; align-items: center; gap: 4px; }
+  .speed button { background: var(--panel); color: var(--text); border: 1px solid var(--border); border-radius: 3px;
+                  padding: 1px 7px; font-size: 11px; cursor: pointer; }
+  .speed button.on { background: #0e639c; border-color: #0e639c; color: #fff; }
+  .legend i { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin: 0 4px 0 10px; }
+
+  /* details */
+  table { border-collapse: collapse; width: 100%; }
+  td { padding: 2px 4px; vertical-align: top; }
+  td:first-child { color: var(--dim); white-space: nowrap; }
+  .peers td { font-size: 12px; }
+  .badge { display: inline-block; padding: 0 6px; border-radius: 3px; font-size: 11px; color: #000; }
+  .warn { color: var(--leader); }
+  button.small { background: #3a3d41; color: var(--text); border: 1px solid var(--border); padding: 3px 8px; margin: 2px; cursor: pointer; }
+  button.small:hover { background: #45494e; }
+  button.danger { border-color: #a1260d; }
+
+  /* bottom panel */
+  #tabs { display: flex; gap: 2px; padding: 0 8px; border-bottom: 1px solid var(--border); }
+  #tabs button { background: none; border: 0; color: var(--dim); padding: 6px 10px; cursor: pointer; text-transform: uppercase; font-size: 11px; border-bottom: 1px solid transparent; }
+  #tabs button.on { color: #fff; border-bottom-color: #fff; }
+  #tabs .spacer { flex: 1; }
+  .tab { display: none; flex: 1; min-height: 0; overflow: auto; padding: 6px 10px; }
+  .tab.on { display: block; }
+  #terminal.on { display: flex; flex-direction: column; }
+  #term-out { flex: 1; overflow: auto; white-space: pre-wrap; }
+  #term-in { display: flex; gap: 6px; align-items: center; border-top: 1px solid var(--border); padding-top: 6px; }
+  #term-in input { flex: 1; background: var(--bg); color: var(--text); border: 1px solid var(--border); padding: 4px 6px; }
+  select { background: var(--bg); color: var(--text); border: 1px solid var(--border); padding: 3px; }
+  #timeline.on { display: flex; flex-direction: column; }
+  #tl-filters { padding-bottom: 6px; border-bottom: 1px solid var(--border); }
+  #tl-filters label { margin-right: 6px; cursor: pointer; }
+  #tl-rows { flex: 1; overflow: auto; padding-top: 4px; }
+  .tl { display: grid; grid-template-columns: 95px 60px 58px 36px 1fr; gap: 8px; padding: 1px 0; }
+  .tl.gap { display: block; color: var(--leader); padding: 3px 0; }
+  .k-STATE { color: #e5c07b; } .k-ELECT { color: #c678dd; } .k-VOTE { color: #56b6c2; }
+  .k-PEER { color: #d19a66; } .k-ERROR { color: #f14c4c; }
+  .ok { color: var(--ok); } .err { color: var(--down); } .muted { color: var(--dim); }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="title"><b>Raft KV</b><span id="summary" class="mono">connecting…</span></div>
+
+  <div id="activity">
+    <button id="act-nodes" class="on" title="Available nodes">▣</button>
+    <button id="act-presets" title="Presets">⚡</button>
+  </div>
+
+  <div id="side">
+    <div id="view-nodes">
+      <h3>Available nodes</h3>
+      <div id="node-list"></div>
+      <p class="hint">Click a node for details, right click for faults.</p>
+    </div>
+    <div id="view-presets" style="display:none">
+      <h3>Presets</h3>
+      <button class="preset" data-preset="crash">💥 Crash the leader</button>
+      <button class="preset" data-preset="isolate">✂ Isolate the leader for 5 s</button>
+      <button class="preset" data-preset="noreply">🔇 NoReply on the leader</button>
+      <button class="preset" data-preset="heal">✚ Heal all (faults off)</button>
+      <p class="hint">A preset finds the leader at the moment you click it.</p>
+    </div>
+  </div>
+
+  <div id="main"><svg id="cluster" viewBox="0 0 700 420"></svg>
+    <div class="speed" title="Only the drawing gets slower. The cluster keeps its real timing.">
+      dots (screen only):
+      <button data-slow="1">1×</button><button data-slow="2">½×</button>
+      <button data-slow="5">⅕×</button><button data-slow="10">⅒×</button>
+    </div>
+    <div class="legend"><i style="background:var(--leader)"></i>leader → follower
+      <i style="background:var(--follower)"></i>follower → leader
+      <i style="background:var(--candidate)"></i>votes · red dashes: nothing for 1.5 s · orange dots: one way only · right click a node for faults</div>
+  </div>
+  <div id="menu"></div>
+
+  <div id="details"><h3>Node</h3><p class="hint">Click a node.</p></div>
+
+  <div id="panel">
+    <div id="tabs">
+      <button data-tab="terminal" class="on">Terminal</button>
+      <button data-tab="timeline">Timeline</button>
+      <button data-tab="output">Output</button>
+      <span class="spacer"></span>
+      <button id="hide-panel" title="Hide the panel">✕</button>
+    </div>
+    <div id="terminal" class="tab on">
+      <div id="term-out" class="mono"></div>
+      <div id="term-in">
+        <span class="muted">to</span>
+        <select id="term-target"><option value="leader">leader</option></select>
+        <input id="term-cmd" class="mono" placeholder="PUT x 5 · GET x · DEL x · INCR c   (↑ ↓ history)" autocomplete="off">
+      </div>
+    </div>
+    <div id="timeline" class="tab">
+      <div id="tl-filters">
+        <span class="muted">nodes</span> <span id="tl-nodes"></span>
+        <span class="muted" style="margin-left:14px">kinds</span> <span id="tl-kinds"></span>
+        <label style="margin-left:14px"><input type="checkbox" id="tl-follow" checked> follow</label>
+        <button class="small" id="tl-clear">clear</button>
+      </div>
+      <div id="tl-rows" class="mono"></div>
+    </div>
+    <div id="output" class="tab mono"></div>
+  </div>
+
+  <div id="status"><span id="st-left">—</span><span id="st-right" style="margin-left:auto"></span></div>
+</div>
+
+<script>
+// ---------- configuration ----------
+const NODES = [
+  { id: 'node1', url: 'http://127.0.0.1:8081' },
+  { id: 'node2', url: 'http://127.0.0.1:8082' },
+  { id: 'node3', url: 'http://127.0.0.1:8083' },
+];
+const POLL_MS = 400;     // how often we ask every node for /status
+const TIMEOUT_MS = 800;  // a node that does not answer in time counts as unreachable
+
+// ---------- state ----------
+// view[id] = { reachable, status (NodeStatus), faults, startedAt } as the node itself reported it
+const view = {};
+let selected = null;
+
+// ---------- talking to the nodes (the HTTP adapter of each node) ----------
+async function getJson(url) {
+  const ctl = new AbortController();
+  const t = setTimeout(() => ctl.abort(), TIMEOUT_MS);
+  try {
+    const r = await fetch(url, { signal: ctl.signal });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    return await r.json();
+  } finally { clearTimeout(t); }
+}
+
+async function postJson(url, body) {
+  const r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                               body: body === undefined ? undefined : JSON.stringify(body) });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.message || ('HTTP ' + r.status));
+  return data;
+}
+
+async function poll() {
+  await Promise.all(NODES.map(async n => {
+    try {
+      const s = await getJson(n.url + '/status');
+      view[n.id] = { reachable: true, status: s.status, faults: s.faults, startedAt: s.startedAt };
+    } catch (e) {
+      view[n.id] = { ...(view[n.id] || {}), reachable: false };   // keep the last status, but mark it as old
+    }
+  }));
+  const flows = traffic();
+  render();
+  sendDots(flows);
+}
+
+// ---------- timeline: the events of all nodes, merged by time ----------
+// Every node keeps its last 500 timeline events (GET /events?after=N). We keep one cursor per node.
+// Two traps: (1) a node restarts -> its numbers start again from 1 (we see it from startedAt);
+// (2) we were away too long -> the node already dropped some events (the first new seq is not cursor + 1).
+const KINDS = ['STATE', 'ELECT', 'VOTE', 'PEER', 'ERROR'];
+const NODE_COLORS = ['#61afef', '#98c379', '#e06c75', '#d19a66', '#56b6c2'];
+const cursor = {}, evStart = {}, restartPending = {};
+const timeline = [];                 // { timeMs, node, kind, term, role, time, message } or { gap: text }
+const MAX_TIMELINE = 1500;
+const tlShow = { nodes: new Set(NODES.map(n => n.id)), kinds: new Set(KINDS) };
+
+async function pollEvents() {
+  let added = false;
+  await Promise.all(NODES.map(async n => {
+    try {
+      let r = await getJson(`${n.url}/events?after=${cursor[n.id] ?? 0}`);
+      const restarted = evStart[n.id] !== undefined && evStart[n.id] !== r.startedAt;
+      if (restarted) {
+        // a new process numbers its events from 1 again, so we ask again from 0 in this same poll
+        cursor[n.id] = 0;
+        r = await getJson(`${n.url}/events?after=0`);
+      }
+      evStart[n.id] = r.startedAt;
+      if (restarted) restartPending[n.id] = true;
+      if (r.events.length === 0) return;
+      if (restartPending[n.id]) {
+        // placed just before the first event of the new process, not at the moment we noticed the restart
+        timeline.push({ timeMs: r.events[0].timeMs - 1, gap: `── ${n.id} restarted: its event numbers start again ──` });
+        restartPending[n.id] = false;
+      }
+      const first = r.events[0].seq, expected = (cursor[n.id] ?? 0) + 1;
+      if (cursor[n.id] !== undefined && first > expected) {
+        timeline.push({ timeMs: r.events[0].timeMs - 1, gap: `── ${n.id}: ${first - expected} older events were not kept by the node ──` });
+      }
+      for (const e of r.events) timeline.push({ ...e, node: n.id });
+      cursor[n.id] = r.events[r.events.length - 1].seq;
+      added = true;
+    } catch (e) { /* a node that does not answer: nothing new from it */ }
+  }));
+  if (!added) return;
+  timeline.sort((a, b) => a.timeMs - b.timeMs);   // all nodes run on this computer, so their clocks agree
+  if (timeline.length > MAX_TIMELINE) timeline.splice(0, timeline.length - MAX_TIMELINE);
+  drawTimeline();
+}
+
+function drawTimeline() {
+  const box = document.getElementById('tl-rows');
+  const atBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 5;
+  const color = id => NODE_COLORS[NODES.findIndex(n => n.id === id) % NODE_COLORS.length];
+  box.innerHTML = timeline
+    .filter(e => e.gap || (tlShow.nodes.has(e.node) && tlShow.kinds.has(e.kind)))
+    .map(e => e.gap ? `<div class="tl gap">${e.gap}</div>`
+      : `<div class="tl"><span class="muted">${e.time}</span><span style="color:${color(e.node)}">${e.node}</span>` +
+        `<span class="k-${e.kind}">${e.kind}</span><span class="muted">T${e.term}</span><span>${escapeHtml(e.message)}</span></div>`)
+    .join('');
+  if (document.getElementById('tl-follow').checked && (atBottom || box.scrollTop === 0)) box.scrollTop = box.scrollHeight;
+}
+
+function escapeHtml(t) { return t.replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' })[c]); }
+
+function filterBoxes(containerId, values, set) {
+  const box = document.getElementById(containerId);
+  for (const v of values) {
+    const l = document.createElement('label');
+    l.innerHTML = `<input type="checkbox" checked> ${v}`;
+    l.firstChild.onchange = e => { e.target.checked ? set.add(v) : set.delete(v); drawTimeline(); };
+    box.appendChild(l);
+  }
+}
+filterBoxes('tl-nodes', NODES.map(n => n.id), tlShow.nodes);
+filterBoxes('tl-kinds', KINDS, tlShow.kinds);
+document.getElementById('tl-clear').onclick = () => { timeline.length = 0; drawTimeline(); };
+
+// ---------- what the page believes about the cluster ----------
+// A node is alive if it answers US (not because another node says so).
+function isIsolated(v) { return v && v.reachable && v.faults && v.faults.startsWith('ISOLATED'); }
+
+// The leader: among the reachable, non-isolated nodes that say LEADER, the one with the highest term.
+// A node that still says LEADER in an older term is a stale leader: it is shown, but not in the centre.
+function currentLeader() {
+  let best = null;
+  for (const n of NODES) {
+    const v = view[n.id];
+    if (!v || !v.reachable || isIsolated(v) || v.status.role !== 'LEADER') continue;
+    if (!best || v.status.term > view[best].status.term) best = n.id;
+  }
+  return best;
+}
+
+function roleColor(v) {
+  if (!v || !v.reachable) return 'var(--down)';
+  if (isIsolated(v)) return 'var(--isolated)';
+  return { LEADER: 'var(--leader)', CANDIDATE: 'var(--candidate)' }[v.status.role] || 'var(--follower)';
+}
+
+// ---------- message traffic ----------
+// Every node counts the messages that REACHED it from each peer (status.peers[].received).
+// The difference between two polls = how many messages went from that peer to that node.
+const lastCount = {};   // "from>to" -> received counter at the previous poll
+const lastSeen = {};    // "from>to" -> time (ms) we last saw at least one new message on that direction
+const lastStart = {};   // node -> startedAt; a restart resets its counters
+function traffic() {
+  const flows = [];     // { from, to, n }
+  const now = Date.now();
+  for (const n of NODES) {
+    const v = view[n.id];
+    if (!v || !v.reachable || !v.status) continue;
+    if (lastStart[n.id] !== v.startedAt) {   // new process: its counters started again from 0
+      lastStart[n.id] = v.startedAt;
+      for (const k in lastCount) if (k.endsWith('>' + n.id)) delete lastCount[k];
+    }
+    for (const p of v.status.peers) {
+      const key = p.id + '>' + n.id;
+      const delta = lastCount[key] === undefined ? 0 : p.received - lastCount[key];
+      lastCount[key] = p.received;
+      if (delta > 0) { lastSeen[key] = now; flows.push({ from: p.id, to: n.id, n: delta }); }
+    }
+  }
+  return flows;
+}
+function quietFor(from, to) { const t = lastSeen[from + '>' + to]; return t === undefined ? Infinity : Date.now() - t; }
+
+const DOT_COLORS = { LEADER: '#e5c07b', FOLLOWER: '#61afef', CANDIDATE: '#c678dd' };
+// Slow motion for the drawing only: a dot takes SLOW times longer to cross the line.
+// The real messages are not delayed; the edge colours (one way, silent) stay real time.
+let SLOW = 1;
+try { SLOW = Number(localStorage.getItem('raft.slow')) || 1; } catch (e) { /* no storage: keep 1 */ }
+
+// At most 3 dots per direction are on a line at the same time, at any speed. Messages that arrive while
+// the line is "full" wait in pending and leave with the next dot, which then shows how many it carries.
+const DOTS_ON_LINE = 3, SIDE = 5;   // SIDE: each direction runs 5 px to one side, so the two do not overlap
+const pending = {}, nextEmit = {};  // "from>to" -> messages not drawn yet / earliest time for the next dot
+const dots = [];                    // { g, from, to, start, duration, stoppedAt, at }
+let liveEdges = new Set();          // "a-b" pairs that have a line right now (set by drawCluster)
+const pairKey = (a, b) => [a, b].sort().join('-');
+
+function sendDots(flows) {
+  if (document.hidden) { for (const k in pending) pending[k] = 0; return; }   // no frames run: do not pile up dots
+  const now = Date.now(), duration = 380 * SLOW, gap = duration / DOTS_ON_LINE;
+  for (const f of flows) pending[f.from + '>' + f.to] = (pending[f.from + '>' + f.to] || 0) + f.n;
+  for (const key in pending) {
+    const [from, to] = key.split('>');
+    // a dot only travels on a line that is drawn; no line, no dot
+    if (!liveEdges.has(pairKey(from, to)) || pending[key] === 0) { pending[key] = 0; continue; }
+    // how many dots can leave before the next poll, keeping `gap` between them
+    const start = Math.max(now, nextEmit[key] || 0);
+    const slots = Math.ceil((now + POLL_MS - start) / gap);
+    if (slots <= 0) continue;                      // line still full: the messages wait for a later poll
+    const count = Math.min(pending[key], slots);
+    const base = Math.floor(pending[key] / count), extra = pending[key] % count;
+    pending[key] = 0;
+    nextEmit[key] = start + count * gap;
+    const role = view[from]?.status?.role;
+    for (let i = 0; i < count; i++) {
+      const stands = base + (i < extra ? 1 : 0);   // how many real messages this dot stands for
+      const g = el('g', { class: 'msg', visibility: 'hidden' }, dotLayer);
+      el('circle', { r: stands > 1 ? 7 : 4, fill: DOT_COLORS[role] || '#aaa' }, g);
+      if (stands > 1) {
+        const t = el('text', { 'text-anchor': 'middle', 'dominant-baseline': 'central', 'font-size': 8,
+                               fill: '#1e1e1e', 'font-weight': 'bold' }, g);
+        t.textContent = stands;
+      }
+      dots.push({ g, from, to, start: start + i * gap, duration, stoppedAt: 0, at: null });
+    }
+  }
+}
+
+// Where a node is drawn right now. While the layout changes, a node slides for .7 s (CSS transition),
+// so its place on screen is between the old and the new position: we read it from the computed style.
+function livePos(id) {
+  const m = new DOMMatrixReadOnly(getComputedStyle(nodeG[id]).transform);
+  return { x: m.e, y: m.f };
+}
+
+// Runs on every animation frame. Lines and dots are placed between the CURRENT positions of their nodes,
+// so they move together with the nodes. A dot whose line is gone stops where it is and fades out.
+const FADE_MS = 300;
+function frame() {
+  const now = Date.now(), p = {};
+  for (const n of NODES) p[n.id] = livePos(n.id);
+  for (const line of edgeLayer.children) {
+    const a = p[line.dataset.a], b = p[line.dataset.b];
+    line.setAttribute('x1', a.x); line.setAttribute('y1', a.y);
+    line.setAttribute('x2', b.x); line.setAttribute('y2', b.y);
+  }
+  for (let i = dots.length - 1; i >= 0; i--) {
+    const d = dots[i];
+    const t = (now - d.start) / d.duration;
+    if (!d.stoppedAt && !liveEdges.has(pairKey(d.from, d.to))) {
+      if (t < 0 || !d.at) { d.g.remove(); dots.splice(i, 1); continue; }   // had not left yet: just drop it
+      d.stoppedAt = now;
+    }
+    if (d.stoppedAt) {
+      const fade = 1 - (now - d.stoppedAt) / FADE_MS;
+      if (fade <= 0) { d.g.remove(); dots.splice(i, 1); } else d.g.setAttribute('opacity', fade);
+      continue;                                    // stays where it stopped
+    }
+    if (t >= 1) { d.g.remove(); dots.splice(i, 1); continue; }
+    if (t < 0) continue;                           // waits for its turn, still hidden
+    const a = p[d.from], b = p[d.to];
+    const len = Math.hypot(b.x - a.x, b.y - a.y) || 1;
+    const ox = -(b.y - a.y) / len * SIDE, oy = (b.x - a.x) / len * SIDE;   // its own side of the line
+    d.at = { x: a.x + (b.x - a.x) * t + ox, y: a.y + (b.y - a.y) * t + oy };
+    d.g.setAttribute('transform', `translate(${d.at.x} ${d.at.y})`);
+    d.g.setAttribute('visibility', 'visible');
+  }
+  requestAnimationFrame(frame);
+}
+
+function setSlow(value) {
+  SLOW = value;
+  try { localStorage.setItem('raft.slow', String(value)); } catch (e) { /* the choice is just not remembered */ }
+  document.querySelectorAll('.speed button').forEach(b => b.classList.toggle('on', Number(b.dataset.slow) === SLOW));
+}
+document.querySelectorAll('.speed button').forEach(b => b.addEventListener('click', () => setSlow(Number(b.dataset.slow))));
+setSlow(SLOW);
+
+// ---------- drawing ----------
+const CENTER = { x: 300, y: 210 }, RADIUS = 150, ISOLATED_X = 620;
+
+function layout() {
+  const leader = currentLeader();
+  const pos = {};
+  const ring = NODES.filter(n => n.id !== leader && !isIsolated(view[n.id]));
+  const isolated = NODES.filter(n => isIsolated(view[n.id]));
+  if (leader) pos[leader] = CENTER;
+  const k = Math.max(ring.length, 1);
+  ring.forEach((n, i) => {   // evenly around the centre: 2 -> left and right, 3 -> triangle, 4 -> an X
+    const a = -Math.PI / 2 + Math.PI / k + i * 2 * Math.PI / k;
+    pos[n.id] = { x: CENTER.x + RADIUS * Math.cos(a), y: CENTER.y + RADIUS * Math.sin(a) };
+  });
+  isolated.forEach((n, i) => { pos[n.id] = { x: ISOLATED_X, y: 110 + i * 110 }; });
+  return { leader, pos };
+}
+
+const svg = document.getElementById('cluster');
+const SVGNS = 'http://www.w3.org/2000/svg';
+function el(tag, attrs, parent) {
+  const e = document.createElementNS(SVGNS, tag);
+  for (const k in attrs) e.setAttribute(k, attrs[k]);
+  if (parent) parent.appendChild(e);
+  return e;
+}
+
+// static parts of the drawing, created once
+const zone = el('g', {}, svg);
+el('rect', { x: 560, y: 40, width: 120, height: 340, rx: 8, fill: 'none', stroke: '#3c3c3c', 'stroke-dasharray': '4 4' }, zone);
+el('text', { x: 620, y: 62, 'text-anchor': 'middle', fill: '#858585', 'font-size': 12 }, zone).textContent = 'isolated';
+const edgeLayer = el('g', {}, svg);
+const dotLayer = el('g', {}, svg);
+const noLeader = el('text', { x: CENTER.x, y: CENTER.y + 5, 'text-anchor': 'middle', fill: '#f14c4c', 'font-size': 15 }, svg);
+const nodeG = {};
+for (const n of NODES) {
+  const g = el('g', { class: 'node-g' }, svg);
+  g.style.transform = `translate(${CENTER.x}px, ${CENTER.y}px)`;
+  el('circle', { r: 34, fill: '#2d2d2d' }, g);
+  el('text', { y: -2, 'font-size': 14, 'font-weight': 600 }, g);
+  el('text', { y: 15, 'font-size': 11 }, g);
+  el('text', { y: 54, 'font-size': 11 }, g);
+  g.addEventListener('click', () => select(n.id));
+  g.addEventListener('contextmenu', e => openMenu(e, n.id));
+  nodeG[n.id] = g;
+}
+
+function drawCluster() {
+  const { leader, pos } = layout();
+  // edges: leader <-> every follower in the ring (Raft traffic goes through the leader).
+  // Their look comes from the traffic the page saw: both ways, one way only, or nothing for 1.5 s.
+  edgeLayer.textContent = '';
+  const drawn = new Set();
+  function edge(x, y, cls) {
+    drawn.add(pairKey(x, y));
+    // the ends are set on every frame from where the nodes are drawn right now (see frame())
+    const a = livePos(x), b = livePos(y);
+    el('line', { class: 'edge ' + cls, x1: a.x, y1: a.y, x2: b.x, y2: b.y, 'data-a': x, 'data-b': y }, edgeLayer);
+  }
+  if (leader) {
+    for (const n of NODES) {
+      if (n.id === leader || !pos[n.id] || isIsolated(view[n.id])) continue;
+      const out = quietFor(leader, n.id) < 1500, back = quietFor(n.id, leader) < 1500;
+      edge(leader, n.id, out && back ? '' : out || back ? 'oneway' : 'silent');
+    }
+  }
+  // any other pair that exchanged messages recently: elections (pre-votes and votes go to everyone)
+  for (const a of NODES) for (const b of NODES) {
+    if (a.id >= b.id || drawn.has([a.id, b.id].sort().join('-')) || !pos[a.id] || !pos[b.id]) continue;
+    if (quietFor(a.id, b.id) < 1500 || quietFor(b.id, a.id) < 1500) edge(a.id, b.id, 'election');
+  }
+  liveEdges = drawn;   // the dots read this: a dot on a pair without a line stops and fades out
+  // an empty centre when there is no leader, with how long it has been empty
+  if (leader) {
+    noLeader.textContent = '';
+  } else {
+    // as long as the connected nodes say; an isolated node is not a witness for the rest of the cluster
+    const ms = Math.max(0, ...NODES.map(n => view[n.id]?.reachable && !isIsolated(view[n.id]) ? view[n.id].status.leaderlessMs : 0));
+    noLeader.textContent = 'no leader · ' + (ms / 1000).toFixed(1) + ' s';
+  }
+  for (const n of NODES) {
+    const v = view[n.id], g = nodeG[n.id], p = pos[n.id] || CENTER;
+    g.style.transform = `translate(${p.x}px, ${p.y}px)`;
+    const [circle, name, role, under] = g.children;
+    circle.setAttribute('stroke', roleColor(v));
+    circle.setAttribute('stroke-dasharray', v && v.reachable ? '' : '5 4');
+    circle.setAttribute('fill', n.id === selected ? '#37373d' : '#2d2d2d');
+    name.textContent = n.id + (n.id === leader ? ' ★' : '');
+    if (!v || !v.status) { role.textContent = 'no answer'; under.textContent = ''; continue; }
+    role.textContent = !v.reachable ? 'DOWN' : isIsolated(v) ? 'ISOLATED' : v.status.role;
+    under.textContent = 'T' + v.status.term + ' · log ' + v.status.lastLogIndex + ' · c ' + v.status.commitIndex;
+  }
+}
+
+let sideKey = '';
+function drawSide() {
+  const list = document.getElementById('node-list');
+  const key = selected + '|' + NODES.map(n => n.id + roleColor(view[n.id]) + (view[n.id]?.status?.role || '')).join(',');
+  if (key === sideKey) return;   // rebuilding the rows on every poll could swallow a click
+  sideKey = key;
+  list.textContent = '';
+  for (const n of NODES) {
+    const v = view[n.id];
+    const row = document.createElement('div');
+    row.className = 'node-row' + (n.id === selected ? ' sel' : '');
+    row.innerHTML = `<span class="dot" style="background:${roleColor(v)}"></span><span>${n.id}</span>
+      <span class="role">${!v || !v.reachable ? 'down' : isIsolated(v) ? 'isolated' : v.status.role.toLowerCase()}</span>`;
+    row.addEventListener('click', () => select(n.id));
+    row.addEventListener('contextmenu', e => openMenu(e, n.id));
+    list.appendChild(row);
+  }
+}
+
+// What a node says about a peer is only as fresh as its last contact with it. A follower talks only to its
+// leader, so about the other followers it keeps an old opinion (e.g. "down" from a pre-vote long ago).
+function peerOpinion(s, p) {
+  const talksToIt = s.role !== 'FOLLOWER' || p.id === s.leader;
+  const fresh = p.msSinceHeard >= 0 && p.msSinceHeard < 3000;
+  if (p.up === null) return '<span class="muted">?</span>';
+  if (!talksToIt && !fresh) {
+    return '<span class="muted" title="Followers do not talk to each other: this is an old opinion">no contact</span>';
+  }
+  return p.up ? 'up' : '<span class="err">down</span>';
+}
+
+function fmtMs(ms) { return ms < 0 ? 'never' : ms < 1000 ? ms + ' ms' : (ms / 1000).toFixed(1) + ' s'; }
+
+let actionsFor = null;
+function drawDetails() {
+  if (!selected) return;
+  const box = document.getElementById('details');
+  if (actionsFor !== selected) {   // the buttons are built once per selection, so a click is never lost to a redraw
+    actionsFor = selected;
+    box.innerHTML = `<div id="det-info"></div>
+    <h3>Faults on ${selected}</h3>
+    <div>
+      <button class="small" onclick="fault('${selected}', {type:'isolate', value:5})">Isolate 5 s</button>
+      <button class="small" onclick="fault('${selected}', {type:'isolate'})">Isolate</button>
+      <button class="small" onclick="askFault('${selected}', 'drop', 'Drop how many % of the RPCs?', 30)">Drop %</button>
+      <button class="small" onclick="askFault('${selected}', 'delay', 'Delay every RPC by how many ms?', 50)">Delay</button>
+      <button class="small" onclick="fault('${selected}', {type:'noreply'})">NoReply</button>
+      <button class="small" onclick="fault('${selected}', {type:'off'})">Off</button>
+      <button class="small danger" onclick="crash('${selected}')">Crash</button>
+    </div>`;
+  }
+  const info = document.getElementById('det-info');
+  const v = view[selected];
+  if (!v || !v.status) { info.innerHTML = `<h3>${selected}</h3><p class="err">No answer yet.</p>`; return; }
+  const s = v.status;
+  const peers = s.peers.map(p => `<tr><td>${p.id}</td><td>${peerOpinion(s, p)}</td>
+      <td>${fmtMs(p.msSinceHeard)}</td><td>${p.matchIndex >= 0 ? p.matchIndex + '/' + p.nextIndex : ''}</td><td>${p.received}</td></tr>`).join('');
+  info.innerHTML = `
+    <h3>${s.id} ${v.reachable ? '' : '<span class="err">(not answering: last known state)</span>'}</h3>
+    <table>
+      <tr><td>role</td><td><span class="badge" style="background:${roleColor(v)}">${s.role}</span> term ${s.term}</td></tr>
+      <tr><td>leader</td><td>${s.leader ?? '<span class="warn">none</span>'}${s.leaderlessMs > 0 ? ' · <span class="warn">for ' + fmtMs(s.leaderlessMs) + '</span>' : ''}</td></tr>
+      <tr><td>voted for</td><td>${s.votedFor ?? 'none'}</td></tr>
+      <tr><td>log</td><td>last ${s.lastLogIndex}/t${s.lastLogTerm}</td></tr>
+      <tr><td>commit</td><td>${s.commitIndex} · applied ${s.lastApplied} · ${s.kvKeys} keys</td></tr>
+      <tr><td>election</td><td>${s.lastElection}</td></tr>
+      <tr><td>faults</td><td>${v.faults ?? ''}</td></tr>
+      <tr><td>switches</td><td>pre-vote ${s.preVoteEnabled ? 'on' : 'off'} · check-quorum ${s.checkQuorumEnabled ? 'on' : 'off'} · read-index ${s.readIndexEnabled ? 'on' : 'off'}</td></tr>
+    </table>
+    <h3>What ${s.id} knows about its peers</h3>
+    <table class="peers"><tr><td>peer</td><td>up</td><td>heard</td><td>match/next</td><td>msgs</td></tr>${peers}</table>`;
+}
+
+function drawBars() {
+  const leader = currentLeader();
+  const up = NODES.filter(n => view[n.id]?.reachable).length;
+  const terms = NODES.map(n => view[n.id]?.status?.term || 0);
+  const commit = leader ? view[leader].status.commitIndex : '—';
+  document.getElementById('summary').textContent =
+      `term ${Math.max(...terms)} · leader ${leader ?? 'none'} · commit ${commit} · ${up}/${NODES.length} answering`;
+  document.getElementById('st-left').textContent = leader ? `leader ${leader}` : 'no leader';
+  document.getElementById('st-right').textContent = `${up}/${NODES.length} nodes answering · poll ${POLL_MS} ms`;
+  document.getElementById('status').classList.toggle('trouble', !leader || up < NODES.length);
+  // terminal targets
+  const sel = document.getElementById('term-target');
+  if (sel.options.length === 1) for (const n of NODES) sel.add(new Option(n.id, n.id));
+}
+
+function render() { drawCluster(); drawSide(); drawDetails(); drawBars(); }
+
+function select(id) { selected = id; render(); }
+
+// ---------- actions (the same functions for the details panel, the presets and later the right click) ----------
+function out(text, cls) {
+  const o = document.getElementById('output');
+  const line = document.createElement('div');
+  line.className = cls || '';
+  line.textContent = new Date().toLocaleTimeString() + '  ' + text;
+  o.prepend(line);
+}
+
+function urlOf(id) { return NODES.find(n => n.id === id).url; }
+
+async function fault(id, req) {
+  try {
+    const r = await postJson(urlOf(id) + '/fault', req);
+    out(`${id} FAULT ${req.type}${req.value != null ? ' ' + req.value : ''} -> ${r.faults}`, 'ok');
+  } catch (e) { out(`${id} FAULT ${req.type} failed: ${e.message}`, 'err'); }
+  poll();
+}
+
+function askFault(id, type, question, def) {
+  const v = prompt(question, def);
+  if (v !== null) fault(id, { type, value: Number(v) });
+}
+
+async function crash(id) {
+  if (!confirm(`Crash ${id}? Its process stops; start it again from its terminal.`)) return;
+  try { await postJson(urlOf(id) + '/crash'); out(`${id} CRASH`, 'err'); }
+  catch (e) { out(`${id} CRASH failed: ${e.message}`, 'err'); }
+}
+
+// ---------- right click menu: the same actions as the details panel ----------
+const menu = document.getElementById('menu');
+const MENU = [
+  ['Isolate for 5 s', id => fault(id, { type: 'isolate', value: 5 })],
+  ['Isolate', id => fault(id, { type: 'isolate' })],
+  ['Drop % of RPCs…', id => askFault(id, 'drop', 'Drop how many % of the RPCs?', 30)],
+  ['Delay RPCs…', id => askFault(id, 'delay', 'Delay every RPC by how many ms?', 50)],
+  ['NoReply', id => fault(id, { type: 'noreply' })],
+  ['Faults off', id => fault(id, { type: 'off' })],
+  null,
+  ['Crash', id => crash(id)],
+];
+function openMenu(e, id) {
+  e.preventDefault();
+  select(id);
+  menu.innerHTML = `<div class="title">${id}</div>`;
+  for (const item of MENU) {
+    const d = document.createElement('div');
+    if (!item) { d.className = 'sep'; } else {
+      d.textContent = item[0];
+      d.onclick = () => { menu.style.display = 'none'; item[1](id); };
+    }
+    menu.appendChild(d);
+  }
+  menu.style.left = e.clientX + 'px';
+  menu.style.top = e.clientY + 'px';
+  menu.style.display = 'block';
+}
+document.addEventListener('click', e => { if (!menu.contains(e.target)) menu.style.display = 'none'; });
+document.addEventListener('keydown', e => { if (e.key === 'Escape') menu.style.display = 'none'; });
+
+document.querySelectorAll('.preset').forEach(b => b.addEventListener('click', () => {
+  const p = b.dataset.preset;
+  if (p === 'heal') { NODES.forEach(n => fault(n.id, { type: 'off' })); return; }
+  const leader = currentLeader();
+  if (!leader) { out(`preset "${b.textContent.trim()}": there is no leader right now`, 'err'); return; }
+  out(`preset "${b.textContent.trim()}" on the leader ${leader}`);
+  if (p === 'crash') crash(leader);
+  if (p === 'isolate') fault(leader, { type: 'isolate', value: 5 });
+  if (p === 'noreply') fault(leader, { type: 'noreply' });
+}));
+
+// ---------- terminal ----------
+const history = []; let histPos = 0;
+const termOut = document.getElementById('term-out');
+function term(text, cls) {
+  const line = document.createElement('div');
+  line.className = cls || '';
+  line.textContent = text;
+  termOut.appendChild(line);
+  termOut.scrollTop = termOut.scrollHeight;
+}
+
+document.getElementById('term-cmd').addEventListener('keydown', async e => {
+  const input = e.target;
+  if (e.key === 'ArrowUp') { histPos = Math.max(0, histPos - 1); input.value = history[histPos] ?? ''; e.preventDefault(); return; }
+  if (e.key === 'ArrowDown') { histPos = Math.min(history.length, histPos + 1); input.value = history[histPos] ?? ''; e.preventDefault(); return; }
+  if (e.key !== 'Enter' || !input.value.trim()) return;
+  const cmd = input.value.trim();
+  history.push(cmd); histPos = history.length; input.value = '';
+  let target = document.getElementById('term-target').value;
+  if (target === 'leader') target = currentLeader() || NODES.find(n => view[n.id]?.reachable)?.id;
+  if (!target) { term(`> ${cmd}\n  no node is answering`, 'err'); return; }
+  term(`${target} > ${cmd}`, 'muted');
+  try {
+    const r = await postJson(urlOf(target) + '/command', { command: cmd });
+    term(`  ${r.success ? '' : 'FAILED: '}${r.result}  (leader ${r.leaderId || '?'}, index ${r.index})`, r.success ? 'ok' : 'err');
+  } catch (err) { term('  ' + err.message, 'err'); }
+});
+
+// ---------- panels: activity bar and tabs, like VS Code ----------
+const app = document.getElementById('app');
+function showSide(which) {
+  const btn = document.getElementById('act-' + which);
+  if (btn.classList.contains('on')) { btn.classList.remove('on'); app.classList.add('no-side'); return; } // click again: hide
+  document.querySelectorAll('#activity button').forEach(b => b.classList.remove('on'));
+  btn.classList.add('on'); app.classList.remove('no-side');
+  document.getElementById('view-nodes').style.display = which === 'nodes' ? '' : 'none';
+  document.getElementById('view-presets').style.display = which === 'presets' ? '' : 'none';
+}
+document.getElementById('act-nodes').onclick = () => showSide('nodes');
+document.getElementById('act-presets').onclick = () => showSide('presets');
+document.querySelectorAll('#tabs button[data-tab]').forEach(b => b.addEventListener('click', () => {
+  app.classList.remove('no-panel');
+  document.querySelectorAll('#tabs button[data-tab]').forEach(x => x.classList.toggle('on', x === b));
+  document.querySelectorAll('.tab').forEach(t => t.classList.toggle('on', t.id === b.dataset.tab));
+}));
+document.getElementById('hide-panel').onclick = () => app.classList.add('no-panel');
+
+poll();
+setInterval(poll, POLL_MS);
+requestAnimationFrame(frame);   // lines and dots follow the nodes on every frame
+pollEvents();
+setInterval(pollEvents, 1000);   // the timeline does not need to be as fast as the diagram
+</script>
+</body>
+</html>

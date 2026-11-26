@@ -2,7 +2,11 @@ package gr.uop.ds.raft;
 
 import java.time.LocalTime;
 import java.time.format.DateTimeFormatter;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.EnumSet;
 import java.util.List;
+import java.util.Set;
 
 import gr.uop.ds.raft.proto.AppendRequest;
 import gr.uop.ds.raft.proto.AppendResponse;
@@ -52,6 +56,16 @@ public class NodeLogger {
     private final boolean color = !"false".equalsIgnoreCase(System.getProperty("raft.color"));
     private volatile boolean verbose = Boolean.getBoolean("raft.verbose");
 
+    /** One line of the log as data, for the dashboard's timeline. */
+    public record Event(long seq, long timeMs, String time, String kind, long term, String role, String message) { }
+
+    private static final int MAX_EVENTS = 500;
+    // the kinds that tell the story of the cluster; SEND, RECV, REPL, APPLY, COMMIT and CLIENT happen for every
+    // command and under load would push the elections out of the buffer in a few seconds
+    private static final Set<Kind> TIMELINE = EnumSet.of(Kind.STATE, Kind.ELECT, Kind.VOTE, Kind.PEER, Kind.ERROR);
+    private final ArrayDeque<Event> events = new ArrayDeque<>(); // the newest MAX_EVENTS timeline events, oldest first
+    private long nextSeq = 1;
+
     public NodeLogger(String nodeId) {
         this.nodeId = nodeId;
     }
@@ -65,13 +79,30 @@ public class NodeLogger {
     }
 
     public void log(Kind kind, long term, RaftNode.Role role, String message) {
+        LocalTime now = LocalTime.now();
+        if (TIMELINE.contains(kind)) remember(now, kind, term, role, message);
         String header = String.format("%s [%s|T%-2d|%-9s] %s",
-                LocalTime.now().format(TIME), nodeId, term, role, kind.label);
+                now.format(TIME), nodeId, term, role, kind.label);
         if (color) {
             System.out.println(kind.color + header + RESET + " " + message);
         } else {
             System.out.println(header + " " + message);
         }
+    }
+
+    // keeps the event; when the buffer is full the oldest one leaves
+    private synchronized void remember(LocalTime now, Kind kind, long term, RaftNode.Role role, String message) {
+        events.addLast(new Event(nextSeq++, System.currentTimeMillis(), now.format(TIME), kind.name(), term, role.name(), message));
+        if (events.size() > MAX_EVENTS) events.pollFirst();
+    }
+
+    /** The remembered events with seq > afterSeq, oldest first. */
+    public synchronized List<Event> eventsAfter(long afterSeq) {
+        List<Event> result = new ArrayList<>();
+        for (Event e : events) {
+            if (e.seq() > afterSeq) result.add(e);
+        }
+        return result;
     }
 
     public static String fmt(VoteRequest r) {

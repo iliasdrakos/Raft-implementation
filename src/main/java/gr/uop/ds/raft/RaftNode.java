@@ -86,6 +86,7 @@ public class RaftNode {
     private final Map<String, ManagedChannel> channels = new LinkedHashMap<>(); // the connection behind each stub
     private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(2); // runs the election timer and the heartbeats
     private ScheduledFuture<?> electionTimer; // the pending startElection(); resetElectionTimer() replaces it
+    private long timerGeneration = 0; // +1 on every reset: a timeout of an older timer is ignored
 
     // Logging only: not used by the algorithm
     private final NodeLogger out;
@@ -97,6 +98,8 @@ public class RaftNode {
     private final Map<String, Long> lastAckSentAt = new HashMap<>(); // per peer: when the newest request it answered was SENT (nanoTime)
     private long readRequestedAt = 0; // nanoTime of the newest read that waits for a heartbeat round
     private final Map<String, Boolean> peerUp = new HashMap<>(); // last known reachability, so we print only changes
+    private final Map<String, Long> lastHeardAt = new HashMap<>(); // per peer: the last time any message from it reached us
+    private final Map<String, Long> receivedFrom = new HashMap<>(); // per peer: how many messages from it reached us
     private long electionTimeoutMs;
     private long lastHeartbeatAt = System.currentTimeMillis();
     private final Map<String, RaftServiceGrpc.RaftServiceStub> asyncPeers = new LinkedHashMap<>(); // non-blocking stubs: the answer arrives later in a callback
@@ -105,6 +108,7 @@ public class RaftNode {
     private int votesAnswered;                                 // how many peers answered or failed in the current election
     private long preVoteTerm = 0;                                 // the term our running pre-vote asks for (0 = no pre-vote running)
     private final Set<String> preVotesGranted = new HashSet<>(); // who said "yes" in the running pre-vote
+    private String lastElection = "none"; // result of our last vote or pre-vote round, for STATUS and the dashboard
     private int preVotesAnswered;                                 // how many peers answered or failed in the running pre-vote
 
     // Timing in ms, configurable for the experiments: -Draft.heartbeat=100 -Draft.electionMin=1500 -Draft.electionMax=3000
@@ -163,7 +167,8 @@ public class RaftNode {
         if (electionTimer != null) electionTimer.cancel(false);
         long timeout = ELECTION_MIN_MS + ThreadLocalRandom.current().nextLong(ELECTION_MAX_MS - ELECTION_MIN_MS);  // We can change the ms in the exec command
         electionTimeoutMs = timeout;
-        electionTimer = scheduler.schedule(this::onElectionTimeout, timeout, TimeUnit.MILLISECONDS);
+        long generation = ++timerGeneration;
+        electionTimer = scheduler.schedule(() -> onElectionTimeout(generation), timeout, TimeUnit.MILLISECONDS);
     }
 
     /**
@@ -211,6 +216,7 @@ public class RaftNode {
         String candidate = req.getCandidateId();
         String reason;
         print(RECV, "<- " + candidate + " " + NodeLogger.fmt(req));
+        markPeer(candidate, true, null); // its request reached us, so it is up
         stepDownIfNewerTerm(req.getTerm(), candidate); // if i don't have the new term i need to get it and become a follower
         if(req.getTerm() < currentTerm) { // he was an old candidate, i can't vote him
             rsp = VoteResponse.newBuilder()
@@ -263,7 +269,7 @@ public class RaftNode {
             votesGranted.add(peer);
             int majority = (peers.size() + 1) / 2 + 1;
             if (votesGranted.size() >= majority) {
-                print(ELECT, "WON term " + electionTerm + " with " + votesGranted.size() + "/" + (peers.size() + 1)
+                electionResult("WON term " + electionTerm + " with " + votesGranted.size() + "/" + (peers.size() + 1)
                         + " votes " + votesGranted);
                 becomeLeader();
                 return;
@@ -286,7 +292,7 @@ public class RaftNode {
     // prints NO MAJORITY once, when every peer has answered and we still have not won
     private void checkElectionOver(long electionTerm) {
         if(role == Role.CANDIDATE && currentTerm == electionTerm && votesAnswered == peers.size()) {
-            print(ELECT, "NO MAJORITY in term " + electionTerm + ": " + votesGranted.size() + "/" + (peers.size() + 1)
+            electionResult("NO MAJORITY in term " + electionTerm + ": " + votesGranted.size() + "/" + (peers.size() + 1)
             + " votes " + votesGranted + " -> new election after the next timeout");
         }  
     }
@@ -297,6 +303,7 @@ public class RaftNode {
      * no new term, no votedFor, no timer reset.
      */
     public synchronized VoteResponse onPreVote(VoteRequest req) {
+        markPeer(req.getCandidateId(), true, null);
         long now = System.currentTimeMillis();
         boolean heardFromLeaderRecently =
                 role == Role.LEADER || (currentLeader != null && now - lastHeartbeatAt < ELECTION_MIN_MS);
@@ -325,6 +332,7 @@ public class RaftNode {
     public synchronized AppendResponse onAppendEntries(AppendRequest req) {
         AppendResponse rsp;
         String leader = req.getLeaderId();
+        markPeer(leader, true, null);
         boolean show = req.getEntriesCount() > 0 || out.isVerbose(); // empty heartbeats only in verbose mode
         if(req.getTerm() < currentTerm) { // Old Leader
             rsp = AppendResponse.newBuilder()
@@ -622,7 +630,7 @@ public class RaftNode {
             preVotesGranted.add(peer);
             int majority = (peers.size() + 1) / 2 + 1;
             if (preVotesGranted.size() >= majority) {
-                print(ELECT, "PRE-VOTE passed for term " + proposedTerm + " with "
+                electionResult( "PRE-VOTE passed for term " + proposedTerm + " with "
                         + preVotesGranted.size() + "/" + (peers.size() + 1) + " votes " + preVotesGranted);
                 preVoteTerm = 0; // close the pre-vote
                 scheduler.execute(this::startElection); // NOT a direct call: we hold the lock
@@ -646,7 +654,7 @@ public class RaftNode {
     // once every peer has answered and we still have no majority: the pre-vote failed
     private void checkPreVoteOver(long proposedTerm) {
         if(preVoteTerm == proposedTerm && preVotesAnswered == peers.size()) {
-            print(ELECT, "PRE-VOTE failed for term " + proposedTerm + ": "
+            electionResult("PRE-VOTE failed for term " + proposedTerm + ": "
                     + preVotesGranted.size() + "/" + (peers.size() + 1) + " votes " + preVotesGranted
                     + " -> we do not raise our term");
             stats.preVoteFailed();
@@ -707,7 +715,12 @@ public class RaftNode {
     }
 
     // the election timer fired: with Pre-Vote we first ask, otherwise we start the election at once
-    private void onElectionTimeout() {
+    private void onElectionTimeout(long generation) {
+        synchronized (this) {
+            // cancel(false) cannot stop a timer that already fired and waits for the lock:
+            // if the timer was reset in the meantime, this timeout is stale
+            if (generation != timerGeneration) return;
+        }
         if (preVoteEnabled) startPreVote();
         else startElection();
     }
@@ -858,8 +871,18 @@ public class RaftNode {
         out.log(kind, currentTerm, role, message);
     }
 
+    // prints an election result and keeps it, so STATUS and the dashboard can show it
+    private synchronized void electionResult(String message) {
+        lastElection = message;
+        print(ELECT, message);
+    }
+
     // remembers whether a peer answers and prints only when this changes, not on every failed heartbeat
     private synchronized void markPeer(String peer, boolean up, String why) {
+        if (up) {
+            lastHeardAt.put(peer, System.currentTimeMillis());
+            receivedFrom.merge(peer, 1L, Long::sum);
+        }
         Boolean before = peerUp.put(peer, up);
         if (before == null || before != up) {
             if (up) {
@@ -878,28 +901,31 @@ public class RaftNode {
         preVoteEnabled = enabled;
     }
 
-    /** The STATUS command: a small table with the whole state of this node. */
-    public synchronized String status() {
-        StringBuilder sb = new StringBuilder();
-        sb.append("------------------- ").append(nodeId).append(" -------------------\n");
-        sb.append(String.format(" role     : %-10s term     : %d%n", role, currentTerm));
-        sb.append(String.format(" leader   : %-10s votedFor : %s%n",
-                currentLeader == null ? "unknown" : currentLeader, votedFor == null ? "none" : votedFor));
-        sb.append(String.format(" log      : %d entries (last %d/t%d)%n", log.lastIndex(), log.lastIndex(), log.lastTerm()));
-        sb.append(String.format(" commit   : %-10d applied  : %d%n", commitIndex, lastApplied));
-        sb.append(String.format(" kv store : %d keys%n", kv.size()));
-        sb.append(" peers    :\n");
+    /** A snapshot of our state as plain data: the CLI prints it, the dashboard sends it as JSON. */
+    public synchronized NodeStatus snapshot() {
+        long now = System.currentTimeMillis();
+        boolean leader = role == Role.LEADER;
+        List<NodeStatus.PeerStatus> peerList = new ArrayList<>();
         for (String p : peers.keySet()) {
-            Boolean up = peerUp.get(p);
-            String reach = up == null ? "unknown" : (up ? "up" : "DOWN");
-            if (role == Role.LEADER) {
-                sb.append(String.format("   %-7s %-8s matchIndex=%-4d nextIndex=%d%n", p, reach, matchIndex.get(p), nextIndex.get(p)));
-            } else {
-                sb.append(String.format("   %-7s %s (last time we talked to it)%n", p, reach));
-            }
+            Long heard = lastHeardAt.get(p);
+            peerList.add(new NodeStatus.PeerStatus(
+                    p,
+                    peerUp.get(p),
+                    heard == null ? -1 : now - heard,
+                    leader ? matchIndex.getOrDefault(p, -1L) : -1,
+                    leader ? nextIndex.getOrDefault(p, -1L) : -1,
+                    receivedFrom.getOrDefault(p, 0L)));
         }
-        sb.append("------------------------------------------------");
-        return sb.toString();
+        return new NodeStatus(nodeId, role, currentTerm, currentLeader, votedFor,
+                commitIndex, lastApplied, log.lastIndex(), log.lastTerm(), kv.size(),
+                preVoteEnabled, checkQuorumEnabled, readIndexEnabled,
+                lastElection, stats.leaderlessMs(now),
+                List.copyOf(peerList));
+    }
+
+    /** The timeline events with seq > afterSeq, for the EVENTS command and the dashboard. */
+    public List<NodeLogger.Event> eventsAfter(long afterSeq) {
+        return out.eventsAfter(afterSeq); // NodeLogger has its own lock
     }
 
     /** The LOG command: every entry of our log and whether it is committed and applied. */

@@ -73,7 +73,7 @@ public final class Stats {
         }
     }
 
-    /** We know a leader again (we follow one, or we became the leader). */
+    /** We know a leader again. */
     public synchronized void leaderFound() {
         if (leaderlessSince != -1) {
             long period = System.currentTimeMillis() - leaderlessSince;
@@ -82,6 +82,11 @@ public final class Stats {
             leaderlessMaxMs = Math.max(leaderlessMaxMs, period);
             leaderlessSince = -1;
         }
+    }
+
+    /** How long we have been without a known leader right now. */
+    public synchronized long leaderlessMs(long now) {
+        return leaderlessSince == -1 ? 0 : now - leaderlessSince;
     }
 
     /** The leader appended a client command at this index. */

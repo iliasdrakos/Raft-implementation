@@ -6,7 +6,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
-
+import gr.uop.ds.raft.admin.DashboardServer;
 import gr.uop.ds.raft.proto.CommandResponse;
 import io.grpc.Server;
 import io.grpc.ServerBuilder;
@@ -44,6 +44,11 @@ public class Raft {
         System.out.println("[" + nodeId + "] listening on port " + port);
         printHelp();
         node.start();
+        if (Boolean.parseBoolean(System.getProperty("raft.http", "true"))) {   // -Draft.http=false: no dashboard API
+            int httpPort = Integer.getInteger("raft.httpPort", 8080 + (port - 50050)); // node1 -> 8081, node2 -> 8082, node3 -> 8083
+            DashboardServer.start(httpPort, node, faults);
+            System.out.println("[" + nodeId + "] dashboard API on http://127.0.0.1:" + httpPort + "/status");
+        }
         // Temporary "client" to type commands in the leader's terminal, e.g. PUT x 5
         BufferedReader in = new BufferedReader(new InputStreamReader(System.in));
         String line;
@@ -91,7 +96,7 @@ public class Raft {
                         printResult(nodeId, "RETRY " + lastCmd + " [#" + cliSeq + "]", r);
                     }
                 }
-                case "STATUS" -> System.out.println(node.status());
+                case "STATUS" -> System.out.println(formatStatus(node.snapshot(), faults.describe()));
                 case "LOG" -> System.out.println(node.logView());
                 case "STATS" -> {
                     if ("reset".equalsIgnoreCase(arg)) {
@@ -141,8 +146,18 @@ public class Raft {
                         runBench(node, n, true);
                     }
                 }
+
+                case "EVENTS" -> {
+                    List<NodeLogger.Event> all = node.eventsAfter(0);
+                    for (NodeLogger.Event e : all.subList(Math.max(0, all.size() - 20), all.size())) {
+                        System.out.printf(" #%-4d %s T%-2d %-9s %-6s %s%n",
+                                e.seq(), e.time(), e.term(), e.role(), e.kind(), e.message());
+                    }
+                }
                 case "HELP" -> printHelp();
                 default -> System.out.println("unknown command: " + parts[0] + " (type HELP)");
+
+                
             }
         }
         server.awaitTermination();
@@ -236,7 +251,40 @@ public class Raft {
         }
     }
 
+    /** The STATUS command: a small table with the whole state of this node. */
+    private static String formatStatus(NodeStatus s, String faults) {
+        boolean leader = s.role() == RaftNode.Role.LEADER;
+        StringBuilder sb = new StringBuilder();
+        sb.append("------------------- ").append(s.id()).append(" -------------------\n");
+        sb.append(String.format(" role     : %-10s term     : %d%n", s.role(), s.term()));
+        sb.append(String.format(" leader   : %-10s votedFor : %s%n",
+                s.leader() == null ? "unknown" : s.leader(), s.votedFor() == null ? "none" : s.votedFor()));
+        sb.append(String.format(" log      : %d entries (last %d/t%d)%n", s.lastLogIndex(), s.lastLogIndex(), s.lastLogTerm()));
+        sb.append(String.format(" commit   : %-10d applied  : %d%n", s.commitIndex(), s.lastApplied()));
+        sb.append(String.format(" kv store : %d keys%n", s.kvKeys()));
+        sb.append(" faults   : ").append(faults).append('\n');
+        sb.append(String.format(" switches : pre-vote=%s, check-quorum=%s, read-index=%s%n",
+                s.preVoteEnabled(), s.checkQuorumEnabled(), s.readIndexEnabled()));
+        if (s.leaderlessMs() > 0) {
+            sb.append(String.format(" NO LEADER for %d ms%n", s.leaderlessMs()));
+        }
+        sb.append(" election : ").append(s.lastElection()).append('\n');
+        sb.append(" peers    :\n");
+        for (NodeStatus.PeerStatus p : s.peers()) {
+            String reach = p.up() == null ? "unknown" : (p.up() ? "up" : "DOWN");
+            String heard = p.msSinceHeard() < 0 ? "never heard" : "heard " + p.msSinceHeard() + " ms ago";
+            if (leader) {
+                sb.append(String.format("   %-7s %-8s matchIndex=%-4d nextIndex=%-4d %s%n",
+                        p.id(), reach, p.matchIndex(), p.nextIndex(), heard));
+            } else {
+                sb.append(String.format("   %-7s %-8s %s%n", p.id(), reach, heard));
+            }
+        }
+        sb.append("------------------------------------------------");
+        return sb.toString();
+    }
+
     private static void printHelp() {
-        System.out.println("commands: PUT key value | DEL key | GET key| LGET key | INCR key | RETRY | STATUS | LOG | VERBOSE on|off | HELP | FAULT [isolate|drop N|delay MS|off] | CRASH | STATS [reset] | BENCH [iterations]");
+        System.out.println("commands: PUT key value | DEL key | GET key| LGET key | INCR key | RETRY | STATUS | LOG | VERBOSE on|off | HELP | FAULT [isolate|drop N|delay MS|off] | CRASH | STATS [reset] | BENCH [iterations] | EVENTS");
     }
 }
